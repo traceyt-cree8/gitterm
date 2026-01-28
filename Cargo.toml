@@ -1,0 +1,13 @@
+[package]
+name = "iced-term-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio"] }
+iced_term = { path = "../iced_term_fork" }
+git2 = "0.19"
+dirs = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rfd = "0.15"
