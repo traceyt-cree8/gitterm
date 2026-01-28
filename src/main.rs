@@ -258,7 +258,7 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let mut app = Self {
-            title: String::from("Git Status Viewer"),
+            title: String::from("Cree8 Claude Git IDE"),
             tabs: Vec::new(),
             active_tab: 0,
             next_tab_id: 0,

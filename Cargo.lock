@@ -686,6 +686,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cree8-claude-git-ide"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "git2",
+ "iced",
+ "iced_term",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1329,19 +1342,6 @@ dependencies = [
  "iced_widget",
  "iced_winit",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "iced-term-test"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "git2",
- "iced",
- "iced_term",
- "rfd",
- "serde",
- "serde_json",
 ]
 
 [[package]]
