@@ -11,6 +11,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+mod log_server;
+mod markdown;
+mod webview;
+
 // Menu item IDs stored globally for event matching
 static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
 
@@ -21,6 +25,7 @@ struct MenuIds {
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
     toggle_theme: muda::MenuId,
+    clear_terminal: muda::MenuId,
 }
 
 fn setup_menu_bar() {
@@ -64,8 +69,16 @@ fn setup_menu_bar() {
             muda::accelerator::Code::Minus,
         )),
     );
+    let clear_terminal = MenuItem::new(
+        "Clear Terminal",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META),
+            muda::accelerator::Code::KeyK,
+        )),
+    );
     terminal_font_menu
-        .append_items(&[&increase_terminal_font, &decrease_terminal_font])
+        .append_items(&[&increase_terminal_font, &decrease_terminal_font, &clear_terminal])
         .unwrap();
 
     // UI font submenu
@@ -129,6 +142,7 @@ fn setup_menu_bar() {
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
+        clear_terminal: clear_terminal.id().clone(),
     });
 
     // Initialize menu for macOS - this must happen after NSApp exists
@@ -507,6 +521,8 @@ struct TabState {
     viewing_file_path: Option<PathBuf>,
     file_content: Vec<String>,
     image_handle: Option<image::Handle>,
+    // Markdown WebView content (rendered HTML)
+    webview_content: Option<String>,
     // Search state
     search: SearchState,
 }
@@ -541,6 +557,7 @@ impl TabState {
             viewing_file_path: None,
             file_content: Vec::new(),
             image_handle: None,
+            webview_content: None,
             search: SearchState::default(),
         }
     }
@@ -549,6 +566,13 @@ impl TabState {
         path.extension()
             .and_then(|e| e.to_str())
             .map(|ext| matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"))
+            .unwrap_or(false)
+    }
+
+    fn is_markdown_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| matches!(ext.to_lowercase().as_str(), "md" | "markdown"))
             .unwrap_or(false)
     }
 
@@ -649,12 +673,21 @@ impl TabState {
         }
     }
 
-    fn load_file(&mut self, path: &PathBuf) {
+    fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
         self.file_content.clear();
         self.image_handle = None;
+        self.webview_content = None;
         self.viewing_file_path = Some(path.clone());
 
-        if Self::is_image_file(path) {
+        if Self::is_markdown_file(path) {
+            // Load as markdown - render to HTML and store for potential browser viewing
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let html = markdown::render_markdown_to_html(&content, is_dark_theme);
+                self.webview_content = Some(html);
+                // Also store raw content for Iced-based rendering
+                self.file_content = content.lines().map(|s| s.to_string()).collect();
+            }
+        } else if Self::is_image_file(path) {
             // Load as image
             self.image_handle = Some(image::Handle::from_path(path));
         } else if let Ok(content) = std::fs::read_to_string(path) {
@@ -965,11 +998,14 @@ pub enum Event {
     NavigateUp,
     ViewFile(PathBuf),
     CloseFileView,
+    CopyFileContent,
+    OpenFileInBrowser,
     // Theme
     ToggleTheme,
     // Font size - Terminal
     IncreaseTerminalFont,
     DecreaseTerminalFont,
+    ClearTerminal,
     // Font size - UI
     IncreaseUiFont,
     DecreaseUiFont,
@@ -986,6 +1022,10 @@ pub enum Event {
     SearchNext,
     SearchPrev,
     SearchClose,
+    // Markdown preview
+    OpenMarkdownInBrowser,
+    // Window events
+    WindowResized(f32, f32),
 }
 
 struct App {
@@ -1000,6 +1040,8 @@ struct App {
     scrollback_lines: usize,
     dragging_divider: bool,
     show_hidden: bool,
+    window_size: (f32, f32),
+    log_server_state: log_server::ServerState,
 }
 
 const MIN_FONT_SIZE: f32 = 10.0;
@@ -1032,6 +1074,47 @@ impl App {
         };
         config.save();
     }
+
+    /// Update the log server with current terminal content
+    fn update_log_server(&self) {
+        let state = self.log_server_state.clone();
+        let mut terminal_snapshots = std::collections::HashMap::new();
+        let mut file_snapshots = std::collections::HashMap::new();
+
+        // Collect terminal content and file content from all tabs
+        for tab in &self.tabs {
+            if let Some(term) = &tab.terminal {
+                let content = term.get_all_text();
+                let snapshot = log_server::TerminalSnapshot {
+                    tab_id: tab.id,
+                    tab_name: tab.repo_name.clone(),
+                    content,
+                };
+                terminal_snapshots.insert(tab.id, snapshot);
+            }
+
+            // If tab is viewing a file, add it to file snapshots
+            if let Some(file_path) = &tab.viewing_file_path {
+                if !tab.file_content.is_empty() {
+                    let content = tab.file_content.join("\n");
+                    let snapshot = log_server::FileSnapshot {
+                        tab_id: tab.id,
+                        file_path: file_path.to_string_lossy().to_string(),
+                        content,
+                    };
+                    file_snapshots.insert(tab.id, snapshot);
+                }
+            }
+        }
+
+        // Update the shared state (spawn a task to avoid blocking)
+        tokio::spawn(async move {
+            let mut terminals = state.terminals.write().await;
+            *terminals = terminal_snapshots;
+            let mut files = state.files.write().await;
+            *files = file_snapshots;
+        });
+    }
 }
 
 impl App {
@@ -1052,6 +1135,15 @@ impl App {
             (config.terminal_font_size, config.ui_font_size)
         };
 
+        // Initialize log server state
+        let log_server_state = log_server::ServerState::new();
+
+        // Start the HTTP log server in the background
+        let server_state = log_server_state.clone();
+        tokio::spawn(async move {
+            log_server::start_server(server_state).await;
+        });
+
         let mut app = Self {
             title: String::from("GitTerm"),
             tabs: Vec::new(),
@@ -1064,6 +1156,8 @@ impl App {
             scrollback_lines: config.scrollback_lines,
             dragging_divider: false,
             show_hidden: config.show_hidden,
+            window_size: (1400.0, 800.0), // Initial size, updated on resize
+            log_server_state,
         };
 
         // Open home directory by default
@@ -1213,6 +1307,9 @@ _gitterm_set_title
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
                 )) => Some(Event::DividerDragEnd),
+                iced::Event::Window(iced::window::Event::Resized(size)) => {
+                    Some(Event::WindowResized(size.width, size.height))
+                }
                 _ => None,
             }),
         ];
@@ -1279,6 +1376,9 @@ _gitterm_set_title
                         tab.fetch_status();
                     }
                 }
+
+                // Update log server with terminal content
+                self.update_log_server();
             }
             Event::InitMenu => {
                 // Initialize native macOS menu bar (must happen after NSApp exists)
@@ -1298,16 +1398,22 @@ _gitterm_set_title
                             return self.update(Event::DecreaseUiFont);
                         } else if event.id == ids.toggle_theme {
                             return self.update(Event::ToggleTheme);
+                        } else if event.id == ids.clear_terminal {
+                            return self.update(Event::ClearTerminal);
                         }
                     }
                 }
             }
             Event::TabSelect(idx) => {
+                // Hide WebView when switching tabs
+                webview::set_visible(false);
                 if idx < self.tabs.len() {
                     self.active_tab = idx;
                 }
             }
             Event::TabClose(idx) => {
+                // Hide WebView when closing tabs
+                webview::set_visible(false);
                 if idx < self.tabs.len() && self.tabs.len() > 1 {
                     self.tabs.remove(idx);
                     if self.active_tab >= self.tabs.len() {
@@ -1333,11 +1439,15 @@ _gitterm_set_title
             }
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
+                // Hide WebView when switching to git diff view
+                webview::set_visible(false);
+
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear file viewer if open
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
                     tab.image_handle = None;
+                    tab.webview_content = None;
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -1349,11 +1459,15 @@ _gitterm_set_title
                 }
             }
             Event::FileSelectByIndex(idx) => {
+                // Hide WebView when switching to git diff view
+                webview::set_visible(false);
+
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear file viewer if open
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
                     tab.image_handle = None;
+                    tab.webview_content = None;
 
                     let total = tab.total_changes() as i32;
                     if total == 0 {
@@ -1397,6 +1511,10 @@ _gitterm_set_title
                                 } else {
                                     return Task::done(Event::SearchNext);
                                 }
+                            }
+                            // Cmd+K - Clear terminal
+                            if c == "k" {
+                                return Task::done(Event::ClearTerminal);
                             }
                         }
                     }
@@ -1466,6 +1584,9 @@ _gitterm_set_title
                 }
             }
             Event::ToggleSidebarMode => {
+                // Hide WebView when switching modes
+                webview::set_visible(false);
+
                 let show_hidden = self.show_hidden;
                 if let Some(tab) = self.active_tab_mut() {
                     tab.sidebar_mode = match tab.sidebar_mode {
@@ -1482,6 +1603,7 @@ _gitterm_set_title
                             tab.viewing_file_path = None;
                             tab.file_content.clear();
                             tab.image_handle = None;
+                            tab.webview_content = None;
                             tab.fetch_status();
                             SidebarMode::Git
                         }
@@ -1530,27 +1652,100 @@ _gitterm_set_title
                 if self.dragging_divider {
                     // Clamp sidebar width between 150 and 600 pixels
                     self.sidebar_width = x.clamp(150.0, 600.0);
+
+                    // Update WebView bounds if active
+                    if webview::is_active() {
+                        let bounds = self.calculate_webview_bounds();
+                        webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                    }
                 }
             }
             Event::ViewFile(path) => {
+                let is_dark_theme = self.theme == AppTheme::Dark;
+                let is_markdown = TabState::is_markdown_file(&path);
+
+                // Hide WebView if switching to non-markdown
+                if !is_markdown && webview::is_active() {
+                    webview::set_visible(false);
+                }
+
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear git selection if any
                     tab.selected_file = None;
                     tab.diff_lines.clear();
-                    tab.load_file(&path);
+                    tab.load_file(&path, is_dark_theme);
+                }
+
+                // Create/update WebView for markdown files
+                if is_markdown {
+                    if let Some(tab) = self.active_tab() {
+                        if let Some(html) = tab.webview_content.clone() {
+                            let bounds = self.calculate_webview_bounds();
+                            // Store the content, then get window access to create WebView
+                            webview::set_pending_content(html, bounds);
+                            return iced::window::oldest().then(move |opt_id| {
+                                if let Some(id) = opt_id {
+                                    iced::window::run(id, move |window| {
+                                        if let Err(e) = webview::try_create_with_window(window) {
+                                            eprintln!("WebView error: {}", e);
+                                        }
+                                    })
+                                    .discard()
+                                } else {
+                                    Task::none()
+                                }
+                            });
+                        }
+                    }
                 }
             }
             Event::CloseFileView => {
+                // Hide WebView
+                webview::set_visible(false);
+
                 if let Some(tab) = self.active_tab_mut() {
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
                     tab.image_handle = None;
+                    tab.webview_content = None;
+                }
+            }
+            Event::CopyFileContent => {
+                if let Some(tab) = self.active_tab() {
+                    if !tab.file_content.is_empty() {
+                        let content = tab.file_content.join("\n");
+                        return iced::clipboard::write(content);
+                    }
+                }
+            }
+            Event::OpenFileInBrowser => {
+                if let Some(tab) = self.active_tab() {
+                    if tab.viewing_file_path.is_some() && !tab.file_content.is_empty() {
+                        let url = format!("http://localhost:3030/file/{}", tab.id);
+                        let _ = std::process::Command::new("open")
+                            .arg(&url)
+                            .spawn();
+                    }
                 }
             }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
                 self.save_config();
                 self.recreate_terminals();
+
+                // Re-render markdown if viewing one
+                let is_dark = self.theme == AppTheme::Dark;
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(path) = &tab.viewing_file_path.clone() {
+                        if TabState::is_markdown_file(path) {
+                            tab.load_file(path, is_dark);
+                            // Update WebView content
+                            if let Some(html) = &tab.webview_content {
+                                webview::update_content(html);
+                            }
+                        }
+                    }
+                }
             }
             Event::IncreaseTerminalFont => {
                 let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
@@ -1566,6 +1761,16 @@ _gitterm_set_title
                     self.terminal_font_size = new_size;
                     self.save_config();
                     self.recreate_terminals();
+                }
+            }
+            Event::ClearTerminal => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(term) = &mut tab.terminal {
+                        // Send the clear command to the terminal
+                        term.handle(iced_term::Command::ProxyToBackend(
+                            iced_term::backend::Command::Write(b"clear\n".to_vec())
+                        ));
+                    }
                 }
             }
             Event::IncreaseUiFont => {
@@ -1648,8 +1853,66 @@ _gitterm_set_title
                     tab.search.current_match = 0;
                 }
             }
+            Event::OpenMarkdownInBrowser => {
+                // Write HTML to temp file and open in browser
+                if let Some(tab) = self.active_tab() {
+                    if let Some(html) = &tab.webview_content {
+                        let temp_dir = std::env::temp_dir();
+                        let file_name = tab
+                            .viewing_file_path
+                            .as_ref()
+                            .and_then(|p| p.file_stem())
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "preview".to_string());
+                        let temp_path = temp_dir.join(format!("{}_preview.html", file_name));
+
+                        if std::fs::write(&temp_path, html).is_ok() {
+                            // Open in default browser
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("open")
+                                    .arg(&temp_path)
+                                    .spawn();
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg(&temp_path)
+                                    .spawn();
+                            }
+                            #[cfg(target_os = "windows")]
+                            {
+                                let _ = std::process::Command::new("cmd")
+                                    .args(["/C", "start", ""])
+                                    .arg(&temp_path)
+                                    .spawn();
+                            }
+                        }
+                    }
+                }
+            }
+            Event::WindowResized(width, height) => {
+                self.window_size = (width, height);
+
+                // Update WebView bounds if active
+                if webview::is_active() {
+                    let bounds = self.calculate_webview_bounds();
+                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                }
+            }
         }
         Task::none()
+    }
+
+    /// Calculate WebView bounds based on current layout
+    fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
+        let tab_bar_height = 40.0;
+        let header_height = 45.0;
+        let x = self.sidebar_width + 4.0; // sidebar + divider
+        let y = tab_bar_height + header_height;
+        let width = (self.window_size.0 - x).max(100.0);
+        let height = (self.window_size.1 - y).max(100.0);
+        (x, y, width, height)
     }
 
     fn recreate_terminals(&mut self) {
@@ -2129,19 +2392,53 @@ _gitterm_set_title
             .map(|p| p.display().to_string())
             .unwrap_or(file_name.clone());
 
+        // Check if this is a markdown file with rendered content
+        let is_markdown = tab.webview_content.is_some();
+
         let header_bg = theme.bg_overlay();
-        let header = row![
-            text(rel_path).size(font).color(theme.text_primary()),
-            iced::widget::Space::new().width(Length::Fill),
-            text("Esc: close").size(font_small).color(theme.text_secondary()),
-            iced::widget::Space::new().width(Length::Fixed(16.0)),
-            button(text("Close").size(font))
-                .style(button::secondary)
-                .padding([4, 8])
-                .on_press(Event::CloseFileView),
-        ]
-        .padding(8)
-        .spacing(8);
+        let header = if is_markdown {
+            // Markdown header with "View in Browser" button for Mermaid support
+            row![
+                text(rel_path).size(font).color(theme.text_primary()),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("View in Browser").size(font))
+                    .style(button::secondary)
+                    .padding([4, 8])
+                    .on_press(Event::OpenMarkdownInBrowser),
+                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                text("Esc: close").size(font_small).color(theme.text_secondary()),
+                iced::widget::Space::new().width(Length::Fixed(16.0)),
+                button(text("Close").size(font))
+                    .style(button::secondary)
+                    .padding([4, 8])
+                    .on_press(Event::CloseFileView),
+            ]
+            .padding(8)
+            .spacing(8)
+        } else {
+            row![
+                text(rel_path).size(font).color(theme.text_primary()),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Copy All").size(font))
+                    .style(button::secondary)
+                    .padding([4, 8])
+                    .on_press(Event::CopyFileContent),
+                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                button(text("Open in Browser").size(font))
+                    .style(button::secondary)
+                    .padding([4, 8])
+                    .on_press(Event::OpenFileInBrowser),
+                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                text("Esc: close").size(font_small).color(theme.text_secondary()),
+                iced::widget::Space::new().width(Length::Fixed(16.0)),
+                button(text("Close").size(font))
+                    .style(button::secondary)
+                    .padding([4, 8])
+                    .on_press(Event::CloseFileView),
+            ]
+            .padding(8)
+            .spacing(8)
+        };
 
         content = content.push(
             container(header)
@@ -2168,6 +2465,21 @@ _gitterm_set_title
                 .height(Length::Fill)
                 .width(Length::Fill),
             );
+        } else if is_markdown && webview::is_active() {
+            // WebView is rendering markdown - show placeholder
+            let bg = theme.bg_base();
+            content = content.push(
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(bg.into()),
+                        ..Default::default()
+                    }),
+            );
+        } else if is_markdown {
+            // Fallback: Render markdown with Iced-native formatting (WebView not ready)
+            content = content.push(self.view_markdown_content(tab));
         } else {
             // File content with line numbers
             let mut file_column = Column::new().spacing(0);
@@ -2230,6 +2542,270 @@ _gitterm_set_title
                 background: Some(bg.into()),
                 ..Default::default()
             })
+            .into()
+    }
+
+    fn view_markdown_content<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let mut content = Column::new().spacing(8).padding(16);
+
+        let mut in_code_block = false;
+        let mut in_mermaid_block = false;
+        let mut code_block_content: Vec<String> = Vec::new();
+        let mut in_list = false;
+
+        for line in &tab.file_content {
+            let trimmed = line.trim();
+
+            // Handle code blocks
+            if trimmed.starts_with("```") {
+                if in_mermaid_block {
+                    // End of mermaid block - just close it (placeholder already shown)
+                    in_mermaid_block = false;
+                    continue;
+                } else if in_code_block {
+                    // End of code block - render accumulated content
+                    let code_bg = theme.bg_overlay();
+                    // Create an owned string for the text widget
+                    let code_content: String = code_block_content.join("\n");
+                    let mut code_col = Column::new().spacing(0);
+                    for code_line in code_content.lines() {
+                        code_col = code_col.push(
+                            text(code_line.to_string())
+                                .size(font - 1.0)
+                                .font(iced::Font::MONOSPACE)
+                                .color(theme.text_primary()),
+                        );
+                    }
+                    content = content.push(
+                        container(code_col)
+                            .width(Length::Fill)
+                            .padding(12)
+                            .style(move |_| container::Style {
+                                background: Some(code_bg.into()),
+                                border: iced::Border {
+                                    radius: 6.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                    );
+                    code_block_content.clear();
+                    in_code_block = false;
+                } else {
+                    // Start of code block - check for mermaid
+                    let lang = trimmed.strip_prefix("```").unwrap_or("");
+                    if lang == "mermaid" {
+                        // Show a placeholder for mermaid diagrams
+                        content = content.push(
+                            container(
+                                column![
+                                    text("Mermaid Diagram")
+                                        .size(font)
+                                        .color(theme.accent()),
+                                    text("Click \"View in Browser\" to see the rendered diagram")
+                                        .size(font - 2.0)
+                                        .color(theme.text_secondary()),
+                                ]
+                                .spacing(4)
+                                .align_x(iced::Alignment::Center),
+                            )
+                            .width(Length::Fill)
+                            .padding(24)
+                            .style(move |_| container::Style {
+                                background: Some(theme.bg_overlay().into()),
+                                border: iced::Border {
+                                    radius: 6.0.into(),
+                                    color: theme.accent(),
+                                    width: 1.0,
+                                },
+                                ..Default::default()
+                            }),
+                        );
+                        // Skip content until closing ```
+                        in_mermaid_block = true;
+                    } else {
+                        in_code_block = true;
+                    }
+                }
+                continue;
+            }
+
+            // Skip mermaid block content
+            if in_mermaid_block {
+                continue;
+            }
+
+            if in_code_block {
+                code_block_content.push(line.clone());
+                continue;
+            }
+
+            // Headers
+            if trimmed.starts_with("######") {
+                let header_text = trimmed.strip_prefix("######").unwrap_or("").trim();
+                content = content.push(
+                    text(header_text)
+                        .size(font)
+                        .color(theme.text_primary()),
+                );
+            } else if trimmed.starts_with("#####") {
+                let header_text = trimmed.strip_prefix("#####").unwrap_or("").trim();
+                content = content.push(
+                    text(header_text)
+                        .size(font + 1.0)
+                        .color(theme.text_primary()),
+                );
+            } else if trimmed.starts_with("####") {
+                let header_text = trimmed.strip_prefix("####").unwrap_or("").trim();
+                content = content.push(
+                    text(header_text)
+                        .size(font + 2.0)
+                        .color(theme.text_primary()),
+                );
+            } else if trimmed.starts_with("###") {
+                let header_text = trimmed.strip_prefix("###").unwrap_or("").trim();
+                content = content.push(
+                    text(header_text)
+                        .size(font + 4.0)
+                        .color(theme.text_primary()),
+                );
+            } else if trimmed.starts_with("##") {
+                let header_text = trimmed.strip_prefix("##").unwrap_or("").trim();
+                let border_color = theme.border();
+                content = content.push(
+                    column![
+                        text(header_text)
+                            .size(font + 6.0)
+                            .color(theme.text_primary()),
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fixed(1.0))
+                            .style(move |_| container::Style {
+                                background: Some(border_color.into()),
+                                ..Default::default()
+                            }),
+                    ]
+                    .spacing(4),
+                );
+            } else if trimmed.starts_with('#') && !trimmed.starts_with("##") {
+                let header_text = trimmed.strip_prefix('#').unwrap_or("").trim();
+                let border_color = theme.border();
+                content = content.push(
+                    column![
+                        text(header_text)
+                            .size(font + 10.0)
+                            .color(theme.text_primary()),
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fixed(1.0))
+                            .style(move |_| container::Style {
+                                background: Some(border_color.into()),
+                                ..Default::default()
+                            }),
+                    ]
+                    .spacing(4),
+                );
+            }
+            // Blockquotes
+            else if trimmed.starts_with('>') {
+                let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
+                let border_color = theme.border();
+                content = content.push(
+                    container(
+                        text(quote_text)
+                            .size(font)
+                            .color(theme.text_secondary()),
+                    )
+                    .padding([8, 16])
+                    .style(move |_| container::Style {
+                        border: iced::Border {
+                            color: border_color,
+                            width: 0.0,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            // Horizontal rule
+            else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                let border_color = theme.border();
+                content = content.push(
+                    container(iced::widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fixed(1.0))
+                        .style(move |_| container::Style {
+                            background: Some(border_color.into()),
+                            ..Default::default()
+                        }),
+                );
+            }
+            // Unordered lists
+            else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                let list_text = &trimmed[2..];
+                content = content.push(
+                    row![
+                        text("  \u{2022}  ").size(font).color(theme.text_secondary()),
+                        text(list_text).size(font).color(theme.text_primary()),
+                    ]
+                    .spacing(0),
+                );
+                in_list = true;
+            }
+            // Task lists
+            else if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+                let is_checked = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]");
+                let task_text = &trimmed[6..];
+                let checkbox = if is_checked { "\u{2611}" } else { "\u{2610}" };
+                content = content.push(
+                    row![
+                        text(format!("  {}  ", checkbox))
+                            .size(font)
+                            .color(if is_checked { theme.success() } else { theme.text_secondary() }),
+                        text(task_text).size(font).color(theme.text_primary()),
+                    ]
+                    .spacing(0),
+                );
+            }
+            // Ordered lists (basic)
+            else if trimmed.len() > 2 && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && trimmed.contains(". ") {
+                if let Some(pos) = trimmed.find(". ") {
+                    let num = &trimmed[..pos];
+                    let list_text = &trimmed[pos + 2..];
+                    content = content.push(
+                        row![
+                            text(format!("  {}.  ", num)).size(font).color(theme.text_secondary()),
+                            text(list_text).size(font).color(theme.text_primary()),
+                        ]
+                        .spacing(0),
+                    );
+                }
+            }
+            // Empty line
+            else if trimmed.is_empty() {
+                if in_list {
+                    in_list = false;
+                }
+                content = content.push(iced::widget::Space::new().height(Length::Fixed(8.0)));
+            }
+            // Regular paragraph
+            else {
+                content = content.push(
+                    text(line)
+                        .size(font)
+                        .color(theme.text_primary()),
+                );
+            }
+        }
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
             .into()
     }
 
