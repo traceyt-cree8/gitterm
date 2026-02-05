@@ -65,10 +65,7 @@ jobs:
       run: |
         cd ..
         if [ ! -d "iced_term_fork" ]; then
-          git clone https://github.com/Harzu/iced_term.git iced_term_fork
-          cd iced_term_fork
-          # Apply custom changes - you may need to push your fork
-          echo "Note: Using upstream iced_term. For custom changes, fork and update the clone URL."
+          git clone https://github.com/traceyt-cree8/iced_term.git iced_term_fork
         fi
 
     - name: Install Rust
