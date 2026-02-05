@@ -11,35 +11,57 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
 
 jobs:
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: gitterm
-            asset_name: gitterm-macos-x86_64
+          # Always build macOS Apple Silicon (most common for dev)
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: gitterm
             asset_name: gitterm-macos-aarch64
+            always_build: true
+          # Only build other platforms on tags or manual dispatch
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: gitterm
+            asset_name: gitterm-macos-x86_64
+            always_build: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: gitterm.exe
             asset_name: gitterm-windows-x86_64.exe
+            always_build: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary_name: gitterm
             asset_name: gitterm-linux-x86_64
+            always_build: false
 
     steps:
+    - name: Check if should build
+      id: should_build
+      run: |
+        if [[ "${{ matrix.always_build }}" == "true" ]] || [[ "${{ github.ref }}" == refs/tags/* ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "build=true" >> $GITHUB_OUTPUT
+        else
+          echo "build=false" >> $GITHUB_OUTPUT
+        fi
+      shell: bash
+
     - uses: actions/checkout@v4
+      if: steps.should_build.outputs.build == 'true'
 
     - name: Checkout iced_term_fork (sibling directory)
+      if: steps.should_build.outputs.build == 'true'
       run: |
         cd ..
         if [ ! -d "iced_term_fork" ]; then
@@ -50,39 +72,34 @@ jobs:
         fi
 
     - name: Install Rust
+      if: steps.should_build.outputs.build == 'true'
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target }}
 
+    - name: Setup Rust cache
+      if: steps.should_build.outputs.build == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
+        cache-on-failure: true
+        shared-key: "gitterm-build"
+
     - name: Install Linux dependencies
-      if: matrix.os == 'ubuntu-latest'
+      if: steps.should_build.outputs.build == 'true' && matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
         sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev pkg-config
 
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
     - name: Build
+      if: steps.should_build.outputs.build == 'true'
       run: cargo build --release --target ${{ matrix.target }}
+      env:
+        CARGO_PROFILE_RELEASE_LTO: "thin"
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
     - name: Create macOS app bundle
-      if: matrix.os == 'macos-latest'
+      if: steps.should_build.outputs.build == 'true' && matrix.os == 'macos-latest'
       run: |
         chmod +x scripts/bundle.sh
         scripts/bundle.sh
@@ -90,6 +107,7 @@ jobs:
         zip -r GitTerm-${{ matrix.target }}.app.zip GitTerm.app
 
     - name: Upload binary
+      if: steps.should_build.outputs.build == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.asset_name }}
@@ -98,7 +116,7 @@ jobs:
           target/GitTerm-${{ matrix.target }}.app.zip
 
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
+      if: steps.should_build.outputs.build == 'true' && startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
         files: |
