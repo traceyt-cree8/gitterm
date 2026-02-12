@@ -1533,6 +1533,12 @@ pub enum Event {
     WorkspaceClose(usize),
     WorkspaceCreate,
     WorkspaceCreated(Option<PathBuf>),
+    // Slide animation events
+    SlideAnimationTick,
+    // Edge peek events
+    EdgePeekEnter(bool),  // true=right, false=left
+    EdgePeekExit,
+    SlideScrolled(scrollable::Viewport),
     // Console panel events
     ConsoleToggle,
     ConsoleStart,
@@ -1564,9 +1570,28 @@ struct App {
     console_height: f32,
     dragging_console_divider: bool,
     editing_console_command: Option<String>,
+    // Slide animation state
+    slide_offset: f32,
+    slide_target: f32,
+    slide_animating: bool,
+    slide_start_time: Option<Instant>,
+    slide_start_offset: f32,
+    // User scroll tracking (for swipe debounce)
+    last_user_scroll: Option<Instant>,
+    // Edge peek state
+    edge_peek_left: bool,
+    edge_peek_right: bool,
 }
 
-const WORKSPACE_RAIL_WIDTH: f32 = 52.0;
+const SPINE_WIDTH: f32 = 16.0;
+
+const SLIDE_DURATION_MS: f32 = 400.0;
+const SWIPE_DEBOUNCE_MS: u64 = 150;
+const EDGE_PEEK_ZONE: f32 = 30.0;
+
+fn workspace_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("ws-slide")
+}
 
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
@@ -1709,13 +1734,31 @@ impl App {
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
             editing_console_command: None,
+            slide_offset: 0.0,
+            slide_target: 0.0,
+            slide_animating: false,
+            slide_start_time: None,
+            slide_start_offset: 0.0,
+            last_user_scroll: None,
+            edge_peek_left: false,
+            edge_peek_right: false,
         };
 
         // Try to restore workspaces from saved config
         if let Some(ws_file) = WorkspacesFile::load() {
             for ws_config in &ws_file.workspaces {
                 let dir = PathBuf::from(&ws_config.dir);
-                let mut workspace = Workspace::new(ws_config.name.clone(), dir.clone(), ws_config.color);
+                let home = std::env::var("HOME").unwrap_or_default();
+                // If workspace dir is $HOME, name the workspace after its first tab's repo instead
+                let name = if dir == PathBuf::from(&home) {
+                    ws_config.tabs.first()
+                        .map(|t| PathBuf::from(&t.dir))
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| ws_config.name.clone())
+                } else {
+                    ws_config.name.clone()
+                };
+                let mut workspace = Workspace::new(name, dir.clone(), ws_config.color);
                 workspace.abbrev = ws_config.abbrev.clone();
                 // Restore saved run command if present
                 if let Some(cmd) = &ws_config.run_command {
@@ -1738,15 +1781,23 @@ impl App {
             app.active_workspace_idx = ws_file.active_workspace.min(app.workspaces.len().saturating_sub(1));
         }
 
-        // If no workspaces were loaded, create a default one
+        // If no workspaces were loaded, create one from the current directory
         if app.workspaces.is_empty() {
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or(cwd);
-            let mut workspace = Workspace::new("Default".to_string(), home.clone(), WorkspaceColor::Lavender);
-            app.add_tab_to_workspace(&mut workspace, home);
+            let dir = cwd;
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Home".to_string());
+            let mut workspace = Workspace::new(name, dir.clone(), WorkspaceColor::Lavender);
+            app.add_tab_to_workspace(&mut workspace, dir);
             app.workspaces.push(workspace);
         }
+
+        // Set initial slide position for active workspace
+        let viewport_width = app.content_viewport_width();
+        let initial_offset = app.active_workspace_idx as f32 * viewport_width;
+        app.slide_offset = initial_offset;
+        app.slide_target = initial_offset;
 
         // Return a task to initialize the menu bar after the app starts
         (app, Task::done(Event::InitMenu))
@@ -1891,6 +1942,11 @@ _gitterm_set_title
         tab
     }
 
+    /// Width of the content area (window width minus spine)
+    fn content_viewport_width(&self) -> f32 {
+        (self.window_size.0 - SPINE_WIDTH).max(1.0)
+    }
+
     fn active_workspace(&self) -> Option<&Workspace> {
         self.workspaces.get(self.active_workspace_idx)
     }
@@ -1943,6 +1999,14 @@ _gitterm_set_title
                 _ => None,
             }),
         ];
+
+        // Animation tick (~60fps) — when animating or waiting for swipe debounce
+        if self.slide_animating || self.last_user_scroll.is_some() {
+            subs.push(
+                iced::time::every(Duration::from_millis(16))
+                    .map(|_| Event::SlideAnimationTick),
+            );
+        }
 
         for ws in &self.workspaces {
             for tab in &ws.tabs {
@@ -2383,7 +2447,7 @@ _gitterm_set_title
             Event::MouseMoved(x, y) => {
                 if self.dragging_divider {
                     // Clamp sidebar width between 150 and 600 pixels (subtract rail width)
-                    self.sidebar_width = (x - WORKSPACE_RAIL_WIDTH).clamp(150.0, 600.0);
+                    self.sidebar_width = (x - SPINE_WIDTH).clamp(150.0, 600.0);
 
                     // Update WebView bounds if active
                     if webview::is_active() {
@@ -2400,6 +2464,22 @@ _gitterm_set_title
                     if webview::is_active() {
                         let bounds = self.calculate_webview_bounds();
                         webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                    }
+                }
+
+                // Edge peek detection — check if cursor is near left/right edge of content area
+                if !self.dragging_divider && !self.dragging_console_divider {
+                    let content_x = x - SPINE_WIDTH; // x relative to content area
+                    let content_width = self.content_viewport_width();
+                    let has_left = self.active_workspace_idx > 0;
+                    let has_right = self.active_workspace_idx + 1 < self.workspaces.len();
+
+                    let near_left = has_left && content_x >= 0.0 && content_x < EDGE_PEEK_ZONE;
+                    let near_right = has_right && content_x > content_width - EDGE_PEEK_ZONE && content_x <= content_width;
+
+                    if near_left != self.edge_peek_left || near_right != self.edge_peek_right {
+                        self.edge_peek_left = near_left;
+                        self.edge_peek_right = near_right;
                     }
                 }
             }
@@ -2657,18 +2737,119 @@ _gitterm_set_title
                 // Clamp console height to new window bounds
                 self.console_height = self.console_height.clamp(32.0, (height - 140.0).max(32.0));
 
+                // Recalculate slide position for new viewport width (snap, no animation)
+                let viewport_width = self.content_viewport_width();
+                let new_target = self.active_workspace_idx as f32 * viewport_width;
+                self.slide_offset = new_target;
+                self.slide_target = new_target;
+                self.slide_animating = false;
+                self.slide_start_time = None;
+
+                let scroll_task = iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::scrollable::scroll_to(
+                        workspace_scrollable_id().into(),
+                        scrollable::AbsoluteOffset { x: Some(new_target), y: None },
+                    ),
+                );
+
                 // Update WebView bounds if active
                 if webview::is_active() {
                     let bounds = self.calculate_webview_bounds();
                     webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
                 }
+
+                return scroll_task;
             }
             Event::WorkspaceSelect(idx) => {
                 webview::set_visible(false);
                 self.editing_console_command = None;
-                if idx < self.workspaces.len() {
+                if idx < self.workspaces.len() && idx != self.active_workspace_idx {
+                    let viewport_width = self.content_viewport_width();
+                    let target = idx as f32 * viewport_width;
+
+                    // Start animation from current position
+                    self.slide_start_offset = self.slide_offset;
+                    self.slide_target = target;
+                    self.slide_start_time = Some(Instant::now());
+                    self.slide_animating = true;
+
+                    // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
                     self.save_workspaces();
+                }
+            }
+            Event::SlideAnimationTick => {
+                // After user stops swiping, snap to nearest workspace
+                if !self.slide_animating {
+                    if let Some(last_scroll) = self.last_user_scroll {
+                        if last_scroll.elapsed().as_millis() >= SWIPE_DEBOUNCE_MS as u128 {
+                            self.last_user_scroll = None;
+                            let viewport_width = self.content_viewport_width();
+                            let target = self.active_workspace_idx as f32 * viewport_width;
+                            if (self.slide_offset - target).abs() > 1.0 {
+                                self.slide_start_offset = self.slide_offset;
+                                self.slide_target = target;
+                                self.slide_start_time = Some(Instant::now());
+                                self.slide_animating = true;
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+
+                // Animate slide with ease-out cubic
+                if let Some(start_time) = self.slide_start_time {
+                    let elapsed = start_time.elapsed().as_millis() as f32;
+                    let t = (elapsed / SLIDE_DURATION_MS).min(1.0);
+                    let eased = 1.0 - (1.0 - t).powi(3);
+                    self.slide_offset =
+                        self.slide_start_offset + (self.slide_target - self.slide_start_offset) * eased;
+
+                    if t >= 1.0 {
+                        self.slide_offset = self.slide_target;
+                        self.slide_animating = false;
+                        self.slide_start_time = None;
+                    }
+
+                    let offset_x = self.slide_offset;
+                    return iced::advanced::widget::operate(
+                        iced::advanced::widget::operation::scrollable::scroll_to(
+                            workspace_scrollable_id().into(),
+                            scrollable::AbsoluteOffset { x: Some(offset_x), y: None },
+                        ),
+                    );
+                }
+            }
+            Event::EdgePeekEnter(is_right) => {
+                if is_right {
+                    self.edge_peek_right = true;
+                } else {
+                    self.edge_peek_left = true;
+                }
+            }
+            Event::EdgePeekExit => {
+                self.edge_peek_left = false;
+                self.edge_peek_right = false;
+            }
+            Event::SlideScrolled(viewport) => {
+                // User swiped — track position, debounce snap until they stop
+                if !self.slide_animating {
+                    let viewport_width = self.content_viewport_width();
+                    if viewport_width > 0.0 {
+                        let offset = viewport.absolute_offset().x;
+                        self.slide_offset = offset;
+                        self.last_user_scroll = Some(Instant::now());
+
+                        // Update active workspace based on current scroll position
+                        let nearest = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let nearest = nearest.min(self.workspaces.len().saturating_sub(1));
+                        if nearest != self.active_workspace_idx {
+                            self.active_workspace_idx = nearest;
+                            self.save_workspaces();
+                            webview::set_visible(false);
+                            self.editing_console_command = None;
+                        }
+                    }
                 }
             }
             Event::WorkspaceClose(idx) => {
@@ -2681,6 +2862,21 @@ _gitterm_set_title
                         self.active_workspace_idx = self.workspaces.len() - 1;
                     }
                     self.save_workspaces();
+
+                    // Snap slide to new active workspace (no animation)
+                    let viewport_width = self.content_viewport_width();
+                    let new_target = self.active_workspace_idx as f32 * viewport_width;
+                    self.slide_offset = new_target;
+                    self.slide_target = new_target;
+                    self.slide_animating = false;
+                    self.slide_start_time = None;
+
+                    return iced::advanced::widget::operate(
+                        iced::advanced::widget::operation::scrollable::scroll_to(
+                            workspace_scrollable_id().into(),
+                            scrollable::AbsoluteOffset { x: Some(new_target), y: None },
+                        ),
+                    );
                 }
             }
             Event::WorkspaceCreate => {
@@ -2706,6 +2902,21 @@ _gitterm_set_title
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
                 self.save_workspaces();
+
+                // Snap slide to new workspace (no animation)
+                let viewport_width = self.content_viewport_width();
+                let new_target = self.active_workspace_idx as f32 * viewport_width;
+                self.slide_offset = new_target;
+                self.slide_target = new_target;
+                self.slide_animating = false;
+                self.slide_start_time = None;
+
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::scrollable::scroll_to(
+                        workspace_scrollable_id().into(),
+                        scrollable::AbsoluteOffset { x: Some(new_target), y: None },
+                    ),
+                );
             }
             Event::WorkspaceCreated(None) => {}
             // Console panel events
@@ -2788,7 +2999,7 @@ _gitterm_set_title
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
         let tab_bar_height = 40.0;
         let header_height = 45.0;
-        let x = WORKSPACE_RAIL_WIDTH + self.sidebar_width + 4.0; // rail + sidebar + divider
+        let x = SPINE_WIDTH + self.sidebar_width + 4.0; // rail + sidebar + divider
         let y = tab_bar_height + header_height;
         let width = (self.window_size.0 - x).max(100.0);
         // Subtract console panel height
@@ -2914,9 +3125,9 @@ _gitterm_set_title
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let workspace_rail = self.view_workspace_rail();
+        let spine = self.view_spine();
         let tab_bar = self.view_tab_bar();
-        let content = self.view_content();
+        let content = self.view_workspace_slide();
         let console_panel = self.view_console_panel();
 
         let mut main_col = Column::new().spacing(0).width(Length::Fill).height(Length::Fill);
@@ -2947,215 +3158,257 @@ _gitterm_set_title
 
         main_col = main_col.push(console_panel);
 
-        row![workspace_rail, main_col]
+        // Bottom workspace bar
+        let workspace_bar = self.view_workspace_bar();
+        main_col = main_col.push(workspace_bar);
+
+        row![spine, main_col]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
-    fn view_workspace_rail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let mut rail = Column::new().spacing(2).padding([6, 0]).align_x(iced::Alignment::Center);
+        let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
+            let text_color = if is_active { ws_color } else { theme.overlay0() };
+            let active_bg = theme.bg_base();
+            let hover_bg = theme.surface0();
 
-            let label = text(&ws.abbrev)
-                .size(13)
-                .color(if is_active { ws_color } else { theme.overlay1() })
-                .font(iced::Font::with_name("Menlo"))
-                .align_x(iced::Alignment::Center);
-
-            let bg_color = if is_active {
-                iced::Color { a: 0.12, ..ws_color }
-            } else {
-                iced::Color::TRANSPARENT
-            };
-
-            let btn_border = if is_active {
-                iced::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: iced::Color { a: 0.4, ..ws_color },
-                }
-            } else {
-                iced::Border {
-                    radius: 8.0.into(),
+            // Colored dot before name
+            let dot_color = if is_active { ws_color } else { theme.surface2() };
+            let dot = container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fixed(6.0))
+                .height(Length::Fixed(6.0))
+                .style(move |_| container::Style {
+                    background: Some(dot_color.into()),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                }
+                });
+
+            let label = text(&ws.name)
+                .size(11)
+                .color(text_color)
+                .font(iced::Font::with_name("Menlo"));
+
+            let btn_content = row![dot, label]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+
+            // Active workspace: colored top accent line above the button
+            if is_active {
+                let accent_line = container(iced::widget::Space::new().width(0).height(0))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(2.0))
+                    .style(move |_| container::Style {
+                        background: Some(ws_color.into()),
+                        ..Default::default()
+                    });
+
+                let ws_btn = button(btn_content)
+                    .style(move |_theme, _status| button::Style {
+                        background: Some(active_bg.into()),
+                        text_color: iced::Color::WHITE,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    })
+                    .padding([4, 12])
+                    .on_press(Event::WorkspaceSelect(idx));
+
+                let stacked = column![accent_line, ws_btn].spacing(0);
+                bar_row = bar_row.push(stacked);
+            } else {
+                let ws_btn = button(btn_content)
+                    .style(move |_theme, status| {
+                        let bg = if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        button::Style {
+                            background: Some(bg.into()),
+                            text_color: iced::Color::WHITE,
+                            border: iced::Border::default(),
+                            ..Default::default()
+                        }
+                    })
+                    .padding([6, 12])
+                    .on_press(Event::WorkspaceSelect(idx));
+
+                bar_row = bar_row.push(ws_btn);
+            }
+
+            // Separator between workspaces
+            if idx < self.workspaces.len() - 1 {
+                let sep_color = theme.surface0();
+                bar_row = bar_row.push(
+                    container(iced::widget::Space::new().width(0).height(0))
+                        .width(Length::Fixed(1.0))
+                        .height(Length::Fixed(14.0))
+                        .style(move |_| container::Style {
+                            background: Some(sep_color.into()),
+                            ..Default::default()
+                        }),
+                );
+            }
+        }
+
+        // "+ workspace" button at the end
+        let ws_add_color = theme.overlay0();
+        let ws_add_hover = theme.overlay1();
+        let ws_add_btn = button(
+            text("+ workspace").size(11).color(ws_add_color).font(iced::Font::with_name("Menlo")),
+        )
+        .style(move |_theme, status| {
+            let tc = if matches!(status, button::Status::Hovered) {
+                ws_add_hover
+            } else {
+                ws_add_color
             };
+            button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                text_color: tc,
+                ..Default::default()
+            }
+        })
+        .padding([6, 12])
+        .on_press(Event::WorkspaceCreate);
+        bar_row = bar_row.push(ws_add_btn);
+
+        bar_row = bar_row.push(iced::widget::Space::new().width(Length::Fill));
+
+        let bg = theme.bg_crust();
+        let top_border_color = theme.surface0();
+
+        let top_border = container(iced::widget::Space::new().height(0))
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(top_border_color.into()),
+                ..Default::default()
+            });
+
+        let bar_container = container(
+            bar_row.padding([0, 4]),
+        )
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        });
+
+        column![top_border, bar_container].into()
+    }
+
+    fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
+
+        for (idx, ws) in self.workspaces.iter().enumerate() {
+            let is_active = idx == self.active_workspace_idx;
+            let ws_color = ws.color.color(theme);
+            let inactive_color = theme.surface2();
+
+            let (dot_w, dot_h) = if is_active { (4.0, 18.0) } else { (4.0, 4.0) };
+            let dot_color = if is_active { ws_color } else { inactive_color };
+
+            let dot = container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fixed(dot_w))
+                .height(Length::Fixed(dot_h))
+                .style(move |_| container::Style {
+                    background: Some(dot_color.into()),
+                    border: iced::Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
 
             let hover_bg = theme.surface0();
-            let ws_btn = button(
-                container(label)
-                    .width(Length::Fixed(38.0))
-                    .height(Length::Fixed(38.0))
-                    .center_x(Length::Fixed(38.0))
-                    .center_y(Length::Fixed(38.0)),
+            let dot_btn = button(
+                container(dot)
+                    .width(Length::Fixed(SPINE_WIDTH - 1.0))
+                    .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
+                    .center_y(Length::Shrink),
             )
             .style(move |_theme, status| {
-                let bg = if is_active {
-                    bg_color
-                } else if matches!(status, button::Status::Hovered) {
+                let bg = if matches!(status, button::Status::Hovered) {
                     hover_bg
                 } else {
                     iced::Color::TRANSPARENT
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: btn_border,
+                    border: iced::Border::default(),
                     text_color: iced::Color::WHITE,
                     ..Default::default()
                 }
             })
-            .padding(0)
+            .padding([4, 0])
             .on_press(Event::WorkspaceSelect(idx));
 
-            // Wrap with left accent bar for active workspace
-            let ws_btn_el: Element<'_, Event, Theme, iced::Renderer> = if is_active {
-                let accent_bg = ws_color;
-                let accent_bar = container(iced::widget::Space::new().width(0).height(0))
-                    .width(Length::Fixed(3.0))
-                    .height(Length::Fixed(20.0))
-                    .style(move |_| container::Style {
-                        background: Some(accent_bg.into()),
-                        border: iced::Border {
-                            radius: 2.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    });
-                row![accent_bar, ws_btn]
-                    .spacing(0)
-                    .align_y(iced::Alignment::Center)
-                    .into()
-            } else {
-                let spacer = iced::widget::Space::new().width(Length::Fixed(3.0));
-                row![spacer, ws_btn]
-                    .spacing(0)
-                    .align_y(iced::Alignment::Center)
-                    .into()
-            };
-
-            rail = rail.push(ws_btn_el);
-
-            // Keyboard hint
-            if idx < 9 {
-                rail = rail.push(
-                    text(format!("^{}", idx + 1))
-                        .size(8)
-                        .color(theme.surface2())
-                        .align_x(iced::Alignment::Center)
-                        .width(Length::Fill),
-                );
-            }
+            dots = dots.push(dot_btn);
         }
-
-        // Divider line
-        let divider_color = theme.surface0();
-        rail = rail.push(
-            container(
-                container(iced::widget::Space::new().width(0).height(0))
-                    .width(Length::Fixed(24.0))
-                    .height(Length::Fixed(1.0))
-                    .style(move |_| container::Style {
-                        background: Some(divider_color.into()),
-                        ..Default::default()
-                    }),
-            )
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-            .padding([4, 0]),
-        );
-
-        // Flexible spacer
-        rail = rail.push(iced::widget::Space::new().height(Length::Fill));
-
-        // Log server port indicator
-        if let Some(base_url) = self.log_server_state.base_url() {
-            let port_text = if let Some(port_str) = base_url.rsplit(':').next() {
-                format!(":{}", port_str)
-            } else {
-                base_url.clone()
-            };
-            let port_color = theme.surface2();
-            rail = rail.push(
-                text(port_text)
-                    .size(9)
-                    .color(port_color)
-                    .font(iced::Font::with_name("Menlo"))
-                    .align_x(iced::Alignment::Center)
-                    .width(Length::Fill),
-            );
-            rail = rail.push(iced::widget::Space::new().height(Length::Fixed(4.0)));
-        }
-
-        // Add workspace button
-        let add_text_color = theme.overlay0();
-        let add_border_color = theme.border();
-        let add_hover_color = theme.overlay1();
-        let add_btn = button(
-            container(
-                text("+")
-                    .size(16)
-                    .color(add_text_color)
-                    .align_x(iced::Alignment::Center),
-            )
-            .width(Length::Fixed(38.0))
-            .height(Length::Fixed(38.0))
-            .center_x(Length::Fixed(38.0))
-            .center_y(Length::Fixed(38.0)),
-        )
-        .style(move |_theme, status| {
-            let bc = if matches!(status, button::Status::Hovered) {
-                add_hover_color
-            } else {
-                add_border_color
-            };
-            button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: bc,
-                },
-                text_color: iced::Color::WHITE,
-                ..Default::default()
-            }
-        })
-        .padding(0)
-        .on_press(Event::WorkspaceCreate);
-
-        rail = rail.push(add_btn);
-        rail = rail.push(iced::widget::Space::new().height(Length::Fixed(6.0)));
 
         let bg = theme.bg_crust();
-        let rail_border_color = theme.surface0();
-        let rail_content = container(rail)
-            .width(Length::Fixed(WORKSPACE_RAIL_WIDTH))
-            .height(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let border_color = theme.surface0();
+
+        let spine_content = container(
+            container(dots)
+                .height(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fixed(SPINE_WIDTH))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        });
 
         // Right border as a separate 1px column
         let border_line = container(iced::widget::Space::new().width(0).height(0))
             .width(Length::Fixed(1.0))
             .height(Length::Fill)
             .style(move |_| container::Style {
-                background: Some(rail_border_color.into()),
+                background: Some(border_color.into()),
                 ..Default::default()
             });
 
-        row![rail_content, border_line].into()
+        row![spine_content, border_line].into()
     }
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut tabs_row = Row::new().spacing(2);
+
+        // Left edge peek indicator
+        if self.edge_peek_left {
+            if let Some(left_ws) = self.workspaces.get(self.active_workspace_idx.wrapping_sub(1)) {
+                let ws_color = left_ws.color.color(theme);
+                let peek_btn = button(
+                    text(format!("\u{2039} {}", left_ws.name))
+                        .size(11)
+                        .color(ws_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .style(move |_theme, _status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    text_color: ws_color,
+                    ..Default::default()
+                })
+                .padding([4, 6])
+                .on_press(Event::WorkspaceSelect(self.active_workspace_idx - 1));
+                tabs_row = tabs_row.push(peek_btn);
+            }
+        }
 
         let (tabs, active_tab_idx) = if let Some(ws) = self.active_workspace() {
             (ws.tabs.as_slice(), ws.active_tab)
@@ -3286,7 +3539,7 @@ _gitterm_set_title
             .on_press(Event::OpenFolder);
         tabs_row = tabs_row.push(add_btn);
 
-        // Right side: spacer + workspace name + branch
+        // Right side: spacer + workspace name + branch + add workspace + peek
         tabs_row = tabs_row.push(iced::widget::Space::new().width(Length::Fill));
 
         if let Some(ws) = self.active_workspace() {
@@ -3298,6 +3551,29 @@ _gitterm_set_title
                     .font(iced::Font::with_name("Menlo")),
             );
 
+            // Close workspace button (only if more than one workspace)
+            if self.workspaces.len() > 1 {
+                let close_color = theme.overlay0();
+                let close_hover = theme.text_primary();
+                let ws_idx = self.active_workspace_idx;
+                let close_ws_btn = button(text("\u{00d7}").size(12).color(close_color))
+                    .style(move |_theme, status| {
+                        let tc = if matches!(status, button::Status::Hovered) {
+                            close_hover
+                        } else {
+                            close_color
+                        };
+                        button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: tc,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 4])
+                    .on_press(Event::WorkspaceClose(ws_idx));
+                tabs_row = tabs_row.push(close_ws_btn);
+            }
+
             if let Some(tab) = self.active_tab() {
                 tabs_row = tabs_row.push(
                     text(format!("  \u{e0a0} {}", tab.branch_name))
@@ -3305,6 +3581,27 @@ _gitterm_set_title
                         .color(theme.overlay0())
                         .font(iced::Font::with_name("Menlo")),
                 );
+            }
+        }
+
+        // Right edge peek indicator
+        if self.edge_peek_right {
+            if let Some(right_ws) = self.workspaces.get(self.active_workspace_idx + 1) {
+                let ws_color = right_ws.color.color(theme);
+                let peek_btn = button(
+                    text(format!("{} \u{203a}", right_ws.name))
+                        .size(11)
+                        .color(ws_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .style(move |_theme, _status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    text_color: ws_color,
+                    ..Default::default()
+                })
+                .padding([4, 6])
+                .on_press(Event::WorkspaceSelect(self.active_workspace_idx + 1));
+                tabs_row = tabs_row.push(peek_btn);
             }
         }
 
@@ -3333,9 +3630,9 @@ _gitterm_set_title
         column![tab_container, separator].into()
     }
 
-    fn view_content(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    fn view_workspace_content<'a>(&'a self, ws: &'a Workspace) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        if let Some(tab) = self.active_tab() {
+        if let Some(tab) = ws.active_tab() {
             let sidebar = self.view_sidebar(tab);
 
             let main_panel = if tab.viewing_file_path.is_some() {
@@ -3392,6 +3689,71 @@ _gitterm_set_title
             })
             .into()
         }
+    }
+
+    fn view_workspace_slide(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let viewport_width = self.content_viewport_width();
+        let active_idx = self.active_workspace_idx;
+        let theme = &self.theme;
+
+        let mut panels = Row::new().spacing(0);
+
+        for (idx, ws) in self.workspaces.iter().enumerate() {
+            // Only render full content for active workspace and immediate neighbors
+            let panel: Element<'_, Event, Theme, iced::Renderer> =
+                if (idx as i32 - active_idx as i32).unsigned_abs() <= 1 {
+                    self.view_workspace_content(ws)
+                } else {
+                    // Distant workspace: render colored placeholder
+                    let bg = theme.bg_base();
+                    container(iced::widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            ..Default::default()
+                        })
+                        .into()
+                };
+
+            let panel_container = container(panel)
+                .width(Length::Fixed(viewport_width))
+                .height(Length::Fill)
+                .clip(true);
+            panels = panels.push(panel_container);
+        }
+
+        scrollable(panels)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .id(workspace_scrollable_id())
+            .on_scroll(Event::SlideScrolled)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme, _status| {
+                let transparent_rail = scrollable::Rail {
+                    background: None,
+                    border: iced::Border::default(),
+                    scroller: scrollable::Scroller {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                    },
+                };
+                scrollable::Style {
+                    container: container::Style::default(),
+                    vertical_rail: transparent_rail,
+                    horizontal_rail: transparent_rail,
+                    gap: None,
+                    auto_scroll: scrollable::AutoScroll {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        icon: iced::Color::TRANSPARENT,
+                    },
+                }
+            })
+            .into()
     }
 
     fn view_sidebar<'a>(
