@@ -170,12 +170,18 @@ struct Config {
     theme: String,
     #[serde(default)]
     show_hidden: bool,
+    #[serde(default = "default_console_height")]
+    console_height: f32,
+    #[serde(default = "default_console_expanded")]
+    console_expanded: bool,
 }
 
 fn default_terminal_font() -> f32 { 14.0 }
 fn default_ui_font() -> f32 { 13.0 }
 fn default_sidebar_width() -> f32 { 280.0 }
 fn default_scrollback_lines() -> usize { 100_000 }
+fn default_console_height() -> f32 { DEFAULT_CONSOLE_HEIGHT }
+fn default_console_expanded() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -187,6 +193,8 @@ impl Default for Config {
             font_size: None,
             theme: "dark".to_string(),
             show_hidden: false,
+            console_height: DEFAULT_CONSOLE_HEIGHT,
+            console_expanded: true,
         }
     }
 }
@@ -211,6 +219,59 @@ impl Config {
 
     fn save(&self) {
         let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+// Workspace persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspacesFile {
+    workspaces: Vec<WorkspaceConfig>,
+    active_workspace: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceConfig {
+    name: String,
+    abbrev: String,
+    dir: String,
+    color: WorkspaceColor,
+    tabs: Vec<WorkspaceTabConfig>,
+    #[serde(default)]
+    run_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceTabConfig {
+    dir: String,
+}
+
+impl WorkspacesFile {
+    fn file_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".config")
+            .join("gitterm")
+            .join("workspaces.json")
+    }
+
+    fn load() -> Option<Self> {
+        let path = Self::file_path();
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            serde_json::from_str(&contents).ok()
+        } else {
+            None
+        }
+    }
+
+    fn save(&self) {
+        let path = Self::file_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -409,6 +470,55 @@ impl AppTheme {
             AppTheme::Light => color!(0xd09090),
         }
     }
+
+    fn bg_crust(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x11111b),
+            AppTheme::Light => color!(0xdce0e8),
+        }
+    }
+
+    fn mauve(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xcba6f7),
+            AppTheme::Light => color!(0x8839ef),
+        }
+    }
+
+    fn peach(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xfab387),
+            AppTheme::Light => color!(0xfe640b),
+        }
+    }
+
+    fn surface0(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x313244),
+            AppTheme::Light => color!(0xccd0da),
+        }
+    }
+
+    fn surface2(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x585b70),
+            AppTheme::Light => color!(0xacb0be),
+        }
+    }
+
+    fn overlay0(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x6c7086),
+            AppTheme::Light => color!(0x9ca0b0),
+        }
+    }
+
+    fn overlay1(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x7f849c),
+            AppTheme::Light => color!(0x8c8fa1),
+        }
+    }
 }
 
 fn main() -> iced::Result {
@@ -491,6 +601,299 @@ struct SearchState {
     query: String,
     matches: Vec<SearchMatch>,
     current_match: usize,
+}
+
+// Console panel constants
+const CONSOLE_HEADER_HEIGHT: f32 = 32.0;
+const CONSOLE_DIVIDER_HEIGHT: f32 = 3.0;
+const DEFAULT_CONSOLE_HEIGHT: f32 = 200.0;
+const MAX_CONSOLE_LINES: usize = 1000;
+
+// Console panel status
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ConsoleStatus {
+    Running,
+    Stopped,
+    Error,
+    NoneConfigured,
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleOutputLine {
+    timestamp: String,
+    content: String,
+    is_stderr: bool,
+}
+
+// Sent through mpsc channel from background task
+#[derive(Debug)]
+enum ConsoleOutputMessage {
+    Stdout(String),
+    Stderr(String),
+    Exited(Option<i32>),
+}
+
+struct ConsoleState {
+    run_command: Option<String>,
+    status: ConsoleStatus,
+    exit_code: Option<i32>,
+    started_at: Option<std::time::Instant>,
+    stopped_at: Option<std::time::Instant>,
+    output_lines: Vec<ConsoleOutputLine>,
+    output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ConsoleOutputMessage>>,
+    child_killer: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ConsoleState {
+    fn new(run_command: Option<String>) -> Self {
+        let status = if run_command.is_some() {
+            ConsoleStatus::Stopped
+        } else {
+            ConsoleStatus::NoneConfigured
+        };
+        Self {
+            run_command,
+            status,
+            exit_code: None,
+            started_at: None,
+            stopped_at: None,
+            output_lines: Vec::new(),
+            output_rx: None,
+            child_killer: None,
+        }
+    }
+
+    fn push_line(&mut self, content: String, is_stderr: bool) {
+        let now = chrono::Local::now();
+        self.output_lines.push(ConsoleOutputLine {
+            timestamp: now.format("%H:%M:%S").to_string(),
+            content,
+            is_stderr,
+        });
+        // Cap output buffer
+        if self.output_lines.len() > MAX_CONSOLE_LINES {
+            let drain_count = self.output_lines.len() - MAX_CONSOLE_LINES;
+            self.output_lines.drain(..drain_count);
+        }
+    }
+
+    fn clear_output(&mut self) {
+        self.output_lines.clear();
+    }
+
+    fn uptime_string(&self) -> String {
+        if let Some(started) = self.started_at {
+            let elapsed = if self.status == ConsoleStatus::Running {
+                started.elapsed()
+            } else if let Some(stopped) = self.stopped_at {
+                stopped.duration_since(started)
+            } else {
+                started.elapsed()
+            };
+            let secs = elapsed.as_secs();
+            if secs < 60 {
+                format!("\u{2191} {}s", secs)
+            } else if secs < 3600 {
+                format!("\u{2191} {}m", secs / 60)
+            } else {
+                format!("\u{2191} {}h{}m", secs / 3600, (secs % 3600) / 60)
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.status == ConsoleStatus::Running
+    }
+
+    fn spawn_process(&mut self, dir: &PathBuf) {
+        let cmd_str = match &self.run_command {
+            Some(cmd) => cmd.clone(),
+            None => return,
+        };
+
+        // Set up channels
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+
+        self.output_rx = Some(rx);
+        self.child_killer = Some(kill_tx);
+        self.status = ConsoleStatus::Running;
+        self.exit_code = None;
+        self.started_at = Some(std::time::Instant::now());
+        self.stopped_at = None;
+
+        let dir = dir.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            use tokio::process::Command;
+
+            // Use a login shell so the user's full environment is available
+            // (bun, nvm, cargo, etc. all add to PATH via shell profiles)
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-l")
+                .arg("-c")
+                .arg(&cmd_str)
+                .current_dir(&dir)
+                .env("TERM", "dumb")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            // Spawn in its own process group so we can kill the entire tree
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx.send(ConsoleOutputMessage::Stderr(format!("Failed to start: {}", e)));
+                    let _ = tx.send(ConsoleOutputMessage::Exited(Some(1)));
+                    return;
+                }
+            };
+
+            let child_pid = child.id();
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+
+            let tx_out = tx.clone();
+            let stdout_task = tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_out.send(ConsoleOutputMessage::Stdout(line)).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let tx_err = tx.clone();
+            let stderr_task = tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_err.send(ConsoleOutputMessage::Stderr(line)).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Wait for either kill signal or natural exit
+            tokio::select! {
+                _ = kill_rx => {
+                    // Kill the entire process group (shell + all children)
+                    #[cfg(unix)]
+                    if let Some(pid) = child_pid {
+                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
+                        // Give processes a moment to clean up, then force kill
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                    }
+                    #[cfg(not(unix))]
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = tx.send(ConsoleOutputMessage::Exited(None));
+                }
+                status = child.wait() => {
+                    let code = status.ok().and_then(|s| s.code());
+                    let _ = tx.send(ConsoleOutputMessage::Exited(code));
+                }
+            }
+
+            stdout_task.abort();
+            stderr_task.abort();
+        });
+    }
+
+    fn kill_process(&mut self) {
+        if let Some(killer) = self.child_killer.take() {
+            let _ = killer.send(());
+        }
+        self.stopped_at = Some(std::time::Instant::now());
+        // output_rx will drain remaining messages including Exited
+    }
+}
+
+fn detect_run_command(dir: &PathBuf) -> Option<String> {
+    // Detect package manager (used by multiple checks)
+    let detect_pm = |dir: &PathBuf| -> &str {
+        if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
+            "bun"
+        } else if dir.join("yarn.lock").exists() {
+            "yarn"
+        } else if dir.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else {
+            "npm"
+        }
+    };
+
+    // 1. Tauri app (has src-tauri/ directory with Cargo.toml)
+    if dir.join("src-tauri").join("Cargo.toml").exists() {
+        // Check if package.json has a "tauri" script (frontend-driven setup)
+        if dir.join("package.json").exists() {
+            let pm = detect_pm(dir);
+            if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                        if scripts.contains_key("tauri") {
+                            return Some(format!("{} run tauri", pm));
+                        }
+                        if scripts.contains_key("tauri:dev") {
+                            return Some(format!("{} run tauri:dev", pm));
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: run cargo tauri dev from inside src-tauri
+        return Some("cd src-tauri && cargo tauri dev".to_string());
+    }
+
+    // 2. package.json (check before bare Cargo.toml for hybrid projects)
+    if dir.join("package.json").exists() {
+        let pm = detect_pm(dir);
+
+        if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                    // Priority: tauri dev > dev > start
+                    for script_name in &["tauri dev", "dev", "start"] {
+                        if scripts.contains_key(*script_name) {
+                            if *script_name == "start" && pm == "npm" {
+                                return Some("npm start".to_string());
+                            }
+                            return Some(format!("{} run {}", pm, script_name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Cargo.toml (plain Rust project)
+    if dir.join("Cargo.toml").exists() {
+        return Some("cargo run".to_string());
+    }
+
+    // 4. docker-compose
+    if dir.join("docker-compose.yml").exists() || dir.join("docker-compose.yaml").exists() {
+        return Some("docker compose up".to_string());
+    }
+
+    // 5. Go project
+    if dir.join("go.mod").exists() {
+        if dir.join("main.go").exists() || dir.join("cmd").is_dir() {
+            return Some("go run .".to_string());
+        }
+    }
+
+    None
 }
 
 // Tab state
@@ -938,6 +1341,103 @@ impl TabState {
     }
 }
 
+// Workspace color palette
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkspaceColor {
+    Lavender,
+    Blue,
+    Green,
+    Peach,
+    Pink,
+    Yellow,
+    Red,
+    Teal,
+}
+
+impl WorkspaceColor {
+    fn color(&self, theme: &AppTheme) -> iced::Color {
+        match theme {
+            AppTheme::Dark => match self {
+                Self::Lavender => color!(0xb4befe),
+                Self::Blue => color!(0x89b4fa),
+                Self::Green => color!(0xa6e3a1),
+                Self::Peach => color!(0xfab387),
+                Self::Pink => color!(0xf5c2e7),
+                Self::Yellow => color!(0xf9e2af),
+                Self::Red => color!(0xf38ba8),
+                Self::Teal => color!(0x94e2d5),
+            },
+            AppTheme::Light => match self {
+                Self::Lavender => color!(0x7287fd),
+                Self::Blue => color!(0x1e66f5),
+                Self::Green => color!(0x40a02b),
+                Self::Peach => color!(0xfe640b),
+                Self::Pink => color!(0xea76cb),
+                Self::Yellow => color!(0xdf8e1d),
+                Self::Red => color!(0xd20f39),
+                Self::Teal => color!(0x179299),
+            },
+        }
+    }
+
+    fn from_index(idx: usize) -> Self {
+        match idx % 8 {
+            0 => Self::Lavender,
+            1 => Self::Blue,
+            2 => Self::Green,
+            3 => Self::Peach,
+            4 => Self::Pink,
+            5 => Self::Yellow,
+            6 => Self::Red,
+            _ => Self::Teal,
+        }
+    }
+}
+
+// Workspace groups tabs by project
+struct Workspace {
+    name: String,
+    abbrev: String,
+    dir: PathBuf,
+    color: WorkspaceColor,
+    tabs: Vec<TabState>,
+    active_tab: usize,
+    console: ConsoleState,
+}
+
+impl Workspace {
+    fn new(name: String, dir: PathBuf, color: WorkspaceColor) -> Self {
+        let abbrev = Self::derive_abbrev(&name);
+        let run_command = detect_run_command(&dir);
+        let console = ConsoleState::new(run_command);
+        Self {
+            name,
+            abbrev,
+            dir,
+            color,
+            tabs: Vec::new(),
+            active_tab: 0,
+            console,
+        }
+    }
+
+    fn derive_abbrev(name: &str) -> String {
+        name.chars()
+            .take(2)
+            .collect::<String>()
+            .to_uppercase()
+    }
+
+    fn active_tab(&self) -> Option<&TabState> {
+        self.tabs.get(self.active_tab)
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut TabState> {
+        self.tabs.get_mut(self.active_tab)
+    }
+}
+
 fn compute_word_diff(old_text: &str, new_text: &str) -> Vec<InlineChange> {
     let diff = TextDiff::from_words(old_text, new_text);
     diff.iter_all_changes()
@@ -1027,12 +1527,29 @@ pub enum Event {
     OpenMarkdownInBrowser,
     // Window events
     WindowResized(f32, f32),
+    WindowCloseRequested,
+    // Workspace events
+    WorkspaceSelect(usize),
+    WorkspaceClose(usize),
+    WorkspaceCreate,
+    WorkspaceCreated(Option<PathBuf>),
+    // Console panel events
+    ConsoleToggle,
+    ConsoleStart,
+    ConsoleStop,
+    ConsoleRestart,
+    ConsoleClearOutput,
+    ConsoleDividerDragStart,
+    ConsoleCommandEditStart,
+    ConsoleCommandChanged(String),
+    ConsoleCommandSubmit,
+    ConsoleCommandCancel,
 }
 
 struct App {
     title: String,
-    tabs: Vec<TabState>,
-    active_tab: usize,
+    workspaces: Vec<Workspace>,
+    active_workspace_idx: usize,
     next_tab_id: usize,
     theme: AppTheme,
     terminal_font_size: f32,
@@ -1043,7 +1560,13 @@ struct App {
     show_hidden: bool,
     window_size: (f32, f32),
     log_server_state: log_server::ServerState,
+    console_expanded: bool,
+    console_height: f32,
+    dragging_console_divider: bool,
+    editing_console_command: Option<String>,
 }
+
+const WORKSPACE_RAIL_WIDTH: f32 = 52.0;
 
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
@@ -1072,8 +1595,31 @@ impl App {
                 AppTheme::Light => "light".to_string(),
             },
             show_hidden: self.show_hidden,
+            console_height: self.console_height,
+            console_expanded: self.console_expanded,
         };
         config.save();
+    }
+
+    fn save_workspaces(&self) {
+        let ws_file = WorkspacesFile {
+            workspaces: self.workspaces.iter().map(|ws| {
+                WorkspaceConfig {
+                    name: ws.name.clone(),
+                    abbrev: ws.abbrev.clone(),
+                    dir: ws.dir.to_string_lossy().to_string(),
+                    color: ws.color,
+                    tabs: ws.tabs.iter().map(|tab| {
+                        WorkspaceTabConfig {
+                            dir: tab.current_dir.to_string_lossy().to_string(),
+                        }
+                    }).collect(),
+                    run_command: ws.console.run_command.clone(),
+                }
+            }).collect(),
+            active_workspace: self.active_workspace_idx,
+        };
+        ws_file.save();
     }
 
     /// Update the log server with current terminal content
@@ -1082,8 +1628,8 @@ impl App {
         let mut terminal_snapshots = std::collections::HashMap::new();
         let mut file_snapshots = std::collections::HashMap::new();
 
-        // Collect terminal content and file content from all tabs
-        for tab in &self.tabs {
+        // Collect terminal content and file content from all tabs across all workspaces
+        for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
             if let Some(term) = &tab.terminal {
                 let content = term.get_all_text();
                 let snapshot = log_server::TerminalSnapshot {
@@ -1147,8 +1693,8 @@ impl App {
 
         let mut app = Self {
             title: String::from("GitTerm"),
-            tabs: Vec::new(),
-            active_tab: 0,
+            workspaces: Vec::new(),
+            active_workspace_idx: 0,
             next_tab_id: 0,
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
@@ -1159,19 +1705,68 @@ impl App {
             show_hidden: config.show_hidden,
             window_size: (1400.0, 800.0), // Initial size, updated on resize
             log_server_state,
+            console_expanded: config.console_expanded,
+            console_height: config.console_height.clamp(32.0, 600.0),
+            dragging_console_divider: false,
+            editing_console_command: None,
         };
 
-        // Open home directory by default
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or(cwd);
-        app.add_tab(home);
+        // Try to restore workspaces from saved config
+        if let Some(ws_file) = WorkspacesFile::load() {
+            for ws_config in &ws_file.workspaces {
+                let dir = PathBuf::from(&ws_config.dir);
+                let mut workspace = Workspace::new(ws_config.name.clone(), dir.clone(), ws_config.color);
+                workspace.abbrev = ws_config.abbrev.clone();
+                // Restore saved run command if present
+                if let Some(cmd) = &ws_config.run_command {
+                    workspace.console.run_command = Some(cmd.clone());
+                    workspace.console.status = ConsoleStatus::Stopped;
+                }
+
+                if ws_config.tabs.is_empty() {
+                    // Always have at least one tab
+                    app.add_tab_to_workspace(&mut workspace, dir);
+                } else {
+                    for tab_config in &ws_config.tabs {
+                        let tab_dir = PathBuf::from(&tab_config.dir);
+                        app.add_tab_to_workspace(&mut workspace, tab_dir);
+                    }
+                }
+
+                app.workspaces.push(workspace);
+            }
+            app.active_workspace_idx = ws_file.active_workspace.min(app.workspaces.len().saturating_sub(1));
+        }
+
+        // If no workspaces were loaded, create a default one
+        if app.workspaces.is_empty() {
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or(cwd);
+            let mut workspace = Workspace::new("Default".to_string(), home.clone(), WorkspaceColor::Lavender);
+            app.add_tab_to_workspace(&mut workspace, home);
+            app.workspaces.push(workspace);
+        }
 
         // Return a task to initialize the menu bar after the app starts
         (app, Task::done(Event::InitMenu))
     }
 
+    fn add_tab_to_workspace(&mut self, workspace: &mut Workspace, repo_path: PathBuf) {
+        let tab = self.create_tab(repo_path);
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
     fn add_tab(&mut self, repo_path: PathBuf) {
+        let tab = self.create_tab(repo_path);
+        if let Some(ws) = self.active_workspace_mut() {
+            ws.tabs.push(tab);
+            ws.active_tab = ws.tabs.len() - 1;
+        }
+    }
+
+    fn create_tab(&mut self, repo_path: PathBuf) -> TabState {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
@@ -1293,21 +1888,32 @@ _gitterm_set_title
         }
 
         tab.fetch_status();
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        tab
+    }
+
+    fn active_workspace(&self) -> Option<&Workspace> {
+        self.workspaces.get(self.active_workspace_idx)
+    }
+
+    fn active_workspace_mut(&mut self) -> Option<&mut Workspace> {
+        self.workspaces.get_mut(self.active_workspace_idx)
     }
 
     fn active_tab(&self) -> Option<&TabState> {
-        self.tabs.get(self.active_tab)
+        self.active_workspace().and_then(|ws| ws.active_tab())
     }
 
     fn active_tab_mut(&mut self) -> Option<&mut TabState> {
-        self.tabs.get_mut(self.active_tab)
+        self.active_workspace_mut().and_then(|ws| ws.active_tab_mut())
     }
 
     fn title(&self) -> String {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            format!("{} - {}", self.title, tab.repo_name)
+        if let Some(ws) = self.active_workspace() {
+            if let Some(tab) = ws.active_tab() {
+                format!("{} - {} - {}", self.title, ws.name, tab.repo_name)
+            } else {
+                format!("{} - {}", self.title, ws.name)
+            }
         } else {
             self.title.clone()
         }
@@ -1331,17 +1937,22 @@ _gitterm_set_title
                 iced::Event::Window(iced::window::Event::Resized(size)) => {
                     Some(Event::WindowResized(size.width, size.height))
                 }
+                iced::Event::Window(iced::window::Event::CloseRequested) => {
+                    Some(Event::WindowCloseRequested)
+                }
                 _ => None,
             }),
         ];
 
-        for tab in &self.tabs {
-            if let Some(term) = &tab.terminal {
-                subs.push(
-                    term.subscription()
-                        .with(tab.id)
-                        .map(|(tab_id, e)| Event::Terminal(tab_id, e)),
-                );
+        for ws in &self.workspaces {
+            for tab in &ws.tabs {
+                if let Some(term) = &tab.terminal {
+                    subs.push(
+                        term.subscription()
+                            .with(tab.id)
+                            .map(|(tab_id, e)| Event::Terminal(tab_id, e)),
+                    );
+                }
             }
         }
 
@@ -1351,7 +1962,11 @@ _gitterm_set_title
     fn update(&mut self, event: Event) -> Task<Event> {
         match event {
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                // Don't forward keyboard input to terminal while editing console command
+                if self.editing_console_command.is_some() {
+                    return Task::none();
+                }
+                if let Some(tab) = self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()).find(|t| t.id == tab_id) {
                     if let Some(term) = &mut tab.terminal {
                         match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
                             iced_term::actions::Action::Shutdown => {}
@@ -1400,6 +2015,9 @@ _gitterm_set_title
 
                 // Update log server with terminal content
                 self.update_log_server();
+
+                // Periodically save workspace state
+                self.save_workspaces();
             }
             Event::InitMenu => {
                 // Initialize native macOS menu bar (must happen after NSApp exists)
@@ -1424,23 +2042,78 @@ _gitterm_set_title
                         }
                     }
                 }
+
+                // Drain console output for all workspaces
+                let mut auto_expand = false;
+                for ws in &mut self.workspaces {
+                    // Take rx out to avoid double-borrow
+                    if let Some(mut rx) = ws.console.output_rx.take() {
+                        let mut count = 0;
+                        let mut exited_info = None;
+                        let mut messages = Vec::new();
+                        loop {
+                            match rx.try_recv() {
+                                Ok(msg) => messages.push(msg),
+                                Err(_) => break,
+                            }
+                            count += 1;
+                            if count >= 200 { break; }
+                        }
+                        for msg in messages {
+                            match msg {
+                                ConsoleOutputMessage::Stdout(line) => {
+                                    ws.console.push_line(line, false);
+                                }
+                                ConsoleOutputMessage::Stderr(line) => {
+                                    ws.console.push_line(line, true);
+                                }
+                                ConsoleOutputMessage::Exited(code) => {
+                                    exited_info = Some(code);
+                                }
+                            }
+                        }
+                        if let Some(code) = exited_info {
+                            ws.console.exit_code = code;
+                            ws.console.stopped_at = Some(std::time::Instant::now());
+                            if code.is_some() && code != Some(0) {
+                                ws.console.status = ConsoleStatus::Error;
+                                auto_expand = true;
+                            } else {
+                                ws.console.status = ConsoleStatus::Stopped;
+                            }
+                            ws.console.child_killer = None;
+                            // Don't put rx back — process is done
+                        } else {
+                            // Put rx back
+                            ws.console.output_rx = Some(rx);
+                        }
+                    }
+                }
+                if auto_expand {
+                    self.console_expanded = true;
+                }
             }
             Event::TabSelect(idx) => {
                 // Hide WebView when switching tabs
                 webview::set_visible(false);
-                if idx < self.tabs.len() {
-                    self.active_tab = idx;
+                if let Some(ws) = self.active_workspace_mut() {
+                    if idx < ws.tabs.len() {
+                        ws.active_tab = idx;
+                    }
                 }
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
                 webview::set_visible(false);
-                if idx < self.tabs.len() && self.tabs.len() > 1 {
-                    self.tabs.remove(idx);
-                    if self.active_tab >= self.tabs.len() {
-                        self.active_tab = self.tabs.len() - 1;
+                if let Some(ws) = self.active_workspace_mut() {
+                    if idx < ws.tabs.len() && ws.tabs.len() > 1 {
+                        ws.tabs.remove(idx);
+                        if ws.active_tab >= ws.tabs.len() {
+                            ws.active_tab = ws.tabs.len() - 1;
+                        }
                     }
                 }
+                self.save_workspaces();
             }
             Event::OpenFolder => {
                 return Task::perform(
@@ -1457,6 +2130,7 @@ _gitterm_set_title
             Event::FolderSelected(Some(path)) => {
                 // Allow any folder, not just git repos
                 self.add_tab(path);
+                self.save_workspaces();
             }
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
@@ -1516,6 +2190,27 @@ _gitterm_set_title
                 }
             }
             Event::KeyPressed(key, modifiers) => {
+                // Escape cancels console command editing
+                if self.editing_console_command.is_some() {
+                    if let Key::Named(key::Named::Escape) = key.as_ref() {
+                        return Task::done(Event::ConsoleCommandCancel);
+                    }
+                }
+
+                // Console shortcuts (Cmd+J, Cmd+Shift+R) - before search shortcuts
+                if modifiers.command() {
+                    if let Key::Character(c) = key.as_ref() {
+                        // Cmd+J - Toggle console panel
+                        if c == "j" && !modifiers.shift() {
+                            return Task::done(Event::ConsoleToggle);
+                        }
+                        // Cmd+Shift+R - Restart console process
+                        if (c == "r" || c == "R") && modifiers.shift() {
+                            return Task::done(Event::ConsoleRestart);
+                        }
+                    }
+                }
+
                 // Handle search shortcuts first (Cmd+F, Cmd+G, Escape when search active)
                 if let Some(tab) = self.active_tab() {
                     // Search shortcuts
@@ -1580,6 +2275,17 @@ _gitterm_set_title
                     }
                 }
 
+                // Workspace switching with Ctrl+1-9
+                if modifiers.control() && !modifiers.command() {
+                    if let Key::Character(c) = key.as_ref() {
+                        if let Ok(num) = c.parse::<usize>() {
+                            if num >= 1 && num <= 9 && num <= self.workspaces.len() {
+                                return Task::done(Event::WorkspaceSelect(num - 1));
+                            }
+                        }
+                    }
+                }
+
                 // Tab switching with Cmd+1-9
                 // Terminal font: Cmd+Plus/Minus, UI font: Cmd+Shift+Plus/Minus
                 if modifiers.command() {
@@ -1597,7 +2303,8 @@ _gitterm_set_title
                                 return Task::done(Event::DecreaseTerminalFont);
                             }
                         } else if let Ok(num) = c.parse::<usize>() {
-                            if num >= 1 && num <= 9 && num <= self.tabs.len() {
+                            let tab_count = self.active_workspace().map(|ws| ws.tabs.len()).unwrap_or(0);
+                            if num >= 1 && num <= 9 && num <= tab_count {
                                 return Task::done(Event::TabSelect(num - 1));
                             }
                         }
@@ -1668,11 +2375,26 @@ _gitterm_set_title
                     self.dragging_divider = false;
                     self.save_config();
                 }
+                if self.dragging_console_divider {
+                    self.dragging_console_divider = false;
+                    self.save_config();
+                }
             }
-            Event::MouseMoved(x, _y) => {
+            Event::MouseMoved(x, y) => {
                 if self.dragging_divider {
-                    // Clamp sidebar width between 150 and 600 pixels
-                    self.sidebar_width = x.clamp(150.0, 600.0);
+                    // Clamp sidebar width between 150 and 600 pixels (subtract rail width)
+                    self.sidebar_width = (x - WORKSPACE_RAIL_WIDTH).clamp(150.0, 600.0);
+
+                    // Update WebView bounds if active
+                    if webview::is_active() {
+                        let bounds = self.calculate_webview_bounds();
+                        webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                    }
+                }
+                if self.dragging_console_divider {
+                    // Console height = distance from bottom of window to mouse position
+                    let new_height = (self.window_size.1 - y).clamp(32.0, self.window_size.1 - 140.0);
+                    self.console_height = new_height;
 
                     // Update WebView bounds if active
                     if webview::is_active() {
@@ -1742,10 +2464,12 @@ _gitterm_set_title
             Event::OpenFileInBrowser => {
                 if let Some(tab) = self.active_tab() {
                     if tab.viewing_file_path.is_some() && !tab.file_content.is_empty() {
-                        let url = format!("http://localhost:3030/file/{}", tab.id);
-                        let _ = std::process::Command::new("open")
-                            .arg(&url)
-                            .spawn();
+                        if let Some(base_url) = self.log_server_state.base_url() {
+                            let url = format!("{}/file/{}", base_url, tab.id);
+                            let _ = std::process::Command::new("open")
+                                .arg(&url)
+                                .spawn();
+                        }
                     }
                 }
             }
@@ -1912,14 +2636,149 @@ _gitterm_set_title
                     }
                 }
             }
+            Event::WindowCloseRequested => {
+                // Kill all console processes
+                for ws in &mut self.workspaces {
+                    ws.console.kill_process();
+                }
+                // Signal the log server to shut down
+                self.log_server_state.shutdown.notify_one();
+                // Close the window
+                return iced::window::oldest().then(|opt_id| {
+                    if let Some(id) = opt_id {
+                        iced::window::close(id)
+                    } else {
+                        iced::exit()
+                    }
+                });
+            }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
+                // Clamp console height to new window bounds
+                self.console_height = self.console_height.clamp(32.0, (height - 140.0).max(32.0));
 
                 // Update WebView bounds if active
                 if webview::is_active() {
                     let bounds = self.calculate_webview_bounds();
                     webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
                 }
+            }
+            Event::WorkspaceSelect(idx) => {
+                webview::set_visible(false);
+                self.editing_console_command = None;
+                if idx < self.workspaces.len() {
+                    self.active_workspace_idx = idx;
+                    self.save_workspaces();
+                }
+            }
+            Event::WorkspaceClose(idx) => {
+                webview::set_visible(false);
+                if idx < self.workspaces.len() && self.workspaces.len() > 1 {
+                    // Kill console process before removing workspace
+                    self.workspaces[idx].console.kill_process();
+                    self.workspaces.remove(idx);
+                    if self.active_workspace_idx >= self.workspaces.len() {
+                        self.active_workspace_idx = self.workspaces.len() - 1;
+                    }
+                    self.save_workspaces();
+                }
+            }
+            Event::WorkspaceCreate => {
+                return Task::perform(
+                    async {
+                        let folder = rfd::AsyncFileDialog::new()
+                            .set_title("Select Workspace Folder")
+                            .pick_folder()
+                            .await;
+                        folder.map(|f| f.path().to_path_buf())
+                    },
+                    Event::WorkspaceCreated,
+                );
+            }
+            Event::WorkspaceCreated(Some(path)) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Workspace".to_string());
+                let color = WorkspaceColor::from_index(self.workspaces.len());
+                let mut workspace = Workspace::new(name, path.clone(), color);
+                self.add_tab_to_workspace(&mut workspace, path);
+                self.workspaces.push(workspace);
+                self.active_workspace_idx = self.workspaces.len() - 1;
+                self.save_workspaces();
+            }
+            Event::WorkspaceCreated(None) => {}
+            // Console panel events
+            Event::ConsoleToggle => {
+                self.console_expanded = !self.console_expanded;
+                self.save_config();
+                // Update WebView bounds if active
+                if webview::is_active() {
+                    let bounds = self.calculate_webview_bounds();
+                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                }
+            }
+            Event::ConsoleStart => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    // Use active tab's directory (tracks terminal cwd), fall back to workspace root
+                    let dir = ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    ws.console.spawn_process(&dir);
+                }
+                self.console_expanded = true;
+            }
+            Event::ConsoleStop => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.kill_process();
+                    ws.console.status = ConsoleStatus::Stopped;
+                }
+            }
+            Event::ConsoleRestart => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.kill_process();
+                    let dir = ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    ws.console.spawn_process(&dir);
+                }
+                self.console_expanded = true;
+            }
+            Event::ConsoleClearOutput => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.clear_output();
+                }
+            }
+            Event::ConsoleDividerDragStart => {
+                self.dragging_console_divider = true;
+            }
+            Event::ConsoleCommandEditStart => {
+                let current = self.active_workspace()
+                    .and_then(|ws| ws.console.run_command.clone())
+                    .unwrap_or_default();
+                self.editing_console_command = Some(current);
+            }
+            Event::ConsoleCommandChanged(val) => {
+                self.editing_console_command = Some(val);
+            }
+            Event::ConsoleCommandSubmit => {
+                if let Some(cmd) = self.editing_console_command.take() {
+                    if let Some(ws) = self.active_workspace_mut() {
+                        if cmd.trim().is_empty() {
+                            ws.console.run_command = None;
+                            ws.console.status = ConsoleStatus::NoneConfigured;
+                        } else {
+                            ws.console.run_command = Some(cmd.trim().to_string());
+                            if !ws.console.is_running() {
+                                ws.console.status = ConsoleStatus::Stopped;
+                            }
+                        }
+                    }
+                    self.save_workspaces();
+                }
+            }
+            Event::ConsoleCommandCancel => {
+                self.editing_console_command = None;
             }
         }
         Task::none()
@@ -1929,15 +2788,21 @@ _gitterm_set_title
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
         let tab_bar_height = 40.0;
         let header_height = 45.0;
-        let x = self.sidebar_width + 4.0; // sidebar + divider
+        let x = WORKSPACE_RAIL_WIDTH + self.sidebar_width + 4.0; // rail + sidebar + divider
         let y = tab_bar_height + header_height;
         let width = (self.window_size.0 - x).max(100.0);
-        let height = (self.window_size.1 - y).max(100.0);
+        // Subtract console panel height
+        let console_h = if self.console_expanded {
+            self.console_height + CONSOLE_DIVIDER_HEIGHT
+        } else {
+            CONSOLE_HEADER_HEIGHT
+        };
+        let height = (self.window_size.1 - y - console_h).max(100.0);
         (x, y, width, height)
     }
 
     fn recreate_terminals(&mut self) {
-        for tab in &mut self.tabs {
+        for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
             // Get shell - platform-specific defaults
             #[cfg(target_os = "windows")]
             let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
@@ -2049,88 +2914,428 @@ _gitterm_set_title
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let workspace_rail = self.view_workspace_rail();
         let tab_bar = self.view_tab_bar();
         let content = self.view_content();
+        let console_panel = self.view_console_panel();
 
-        column![tab_bar, content]
+        let mut main_col = Column::new().spacing(0).width(Length::Fill).height(Length::Fill);
+        main_col = main_col.push(tab_bar);
+        main_col = main_col.push(content);
+
+        // Console divider (only when expanded)
+        if self.console_expanded {
+            let theme = &self.theme;
+            let divider_color = if self.dragging_console_divider {
+                theme.accent()
+            } else {
+                theme.surface0()
+            };
+            let console_divider = iced::widget::mouse_area(
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fixed(CONSOLE_DIVIDER_HEIGHT))
+                    .style(move |_| container::Style {
+                        background: Some(divider_color.into()),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Event::ConsoleDividerDragStart)
+            .interaction(iced::mouse::Interaction::ResizingVertically);
+            main_col = main_col.push(console_divider);
+        }
+
+        main_col = main_col.push(console_panel);
+
+        row![workspace_rail, main_col]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
+    fn view_workspace_rail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mut rail = Column::new().spacing(2).padding([6, 0]).align_x(iced::Alignment::Center);
+
+        for (idx, ws) in self.workspaces.iter().enumerate() {
+            let is_active = idx == self.active_workspace_idx;
+            let ws_color = ws.color.color(theme);
+
+            let label = text(&ws.abbrev)
+                .size(13)
+                .color(if is_active { ws_color } else { theme.overlay1() })
+                .font(iced::Font::with_name("Menlo"))
+                .align_x(iced::Alignment::Center);
+
+            let bg_color = if is_active {
+                iced::Color { a: 0.12, ..ws_color }
+            } else {
+                iced::Color::TRANSPARENT
+            };
+
+            let btn_border = if is_active {
+                iced::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: iced::Color { a: 0.4, ..ws_color },
+                }
+            } else {
+                iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                }
+            };
+
+            let hover_bg = theme.surface0();
+            let ws_btn = button(
+                container(label)
+                    .width(Length::Fixed(38.0))
+                    .height(Length::Fixed(38.0))
+                    .center_x(Length::Fixed(38.0))
+                    .center_y(Length::Fixed(38.0)),
+            )
+            .style(move |_theme, status| {
+                let bg = if is_active {
+                    bg_color
+                } else if matches!(status, button::Status::Hovered) {
+                    hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: btn_border,
+                    text_color: iced::Color::WHITE,
+                    ..Default::default()
+                }
+            })
+            .padding(0)
+            .on_press(Event::WorkspaceSelect(idx));
+
+            // Wrap with left accent bar for active workspace
+            let ws_btn_el: Element<'_, Event, Theme, iced::Renderer> = if is_active {
+                let accent_bg = ws_color;
+                let accent_bar = container(iced::widget::Space::new().width(0).height(0))
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(20.0))
+                    .style(move |_| container::Style {
+                        background: Some(accent_bg.into()),
+                        border: iced::Border {
+                            radius: 2.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                row![accent_bar, ws_btn]
+                    .spacing(0)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            } else {
+                let spacer = iced::widget::Space::new().width(Length::Fixed(3.0));
+                row![spacer, ws_btn]
+                    .spacing(0)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            };
+
+            rail = rail.push(ws_btn_el);
+
+            // Keyboard hint
+            if idx < 9 {
+                rail = rail.push(
+                    text(format!("^{}", idx + 1))
+                        .size(8)
+                        .color(theme.surface2())
+                        .align_x(iced::Alignment::Center)
+                        .width(Length::Fill),
+                );
+            }
+        }
+
+        // Divider line
+        let divider_color = theme.surface0();
+        rail = rail.push(
+            container(
+                container(iced::widget::Space::new().width(0).height(0))
+                    .width(Length::Fixed(24.0))
+                    .height(Length::Fixed(1.0))
+                    .style(move |_| container::Style {
+                        background: Some(divider_color.into()),
+                        ..Default::default()
+                    }),
+            )
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .padding([4, 0]),
+        );
+
+        // Flexible spacer
+        rail = rail.push(iced::widget::Space::new().height(Length::Fill));
+
+        // Log server port indicator
+        if let Some(base_url) = self.log_server_state.base_url() {
+            let port_text = if let Some(port_str) = base_url.rsplit(':').next() {
+                format!(":{}", port_str)
+            } else {
+                base_url.clone()
+            };
+            let port_color = theme.surface2();
+            rail = rail.push(
+                text(port_text)
+                    .size(9)
+                    .color(port_color)
+                    .font(iced::Font::with_name("Menlo"))
+                    .align_x(iced::Alignment::Center)
+                    .width(Length::Fill),
+            );
+            rail = rail.push(iced::widget::Space::new().height(Length::Fixed(4.0)));
+        }
+
+        // Add workspace button
+        let add_text_color = theme.overlay0();
+        let add_border_color = theme.border();
+        let add_hover_color = theme.overlay1();
+        let add_btn = button(
+            container(
+                text("+")
+                    .size(16)
+                    .color(add_text_color)
+                    .align_x(iced::Alignment::Center),
+            )
+            .width(Length::Fixed(38.0))
+            .height(Length::Fixed(38.0))
+            .center_x(Length::Fixed(38.0))
+            .center_y(Length::Fixed(38.0)),
+        )
+        .style(move |_theme, status| {
+            let bc = if matches!(status, button::Status::Hovered) {
+                add_hover_color
+            } else {
+                add_border_color
+            };
+            button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: bc,
+                },
+                text_color: iced::Color::WHITE,
+                ..Default::default()
+            }
+        })
+        .padding(0)
+        .on_press(Event::WorkspaceCreate);
+
+        rail = rail.push(add_btn);
+        rail = rail.push(iced::widget::Space::new().height(Length::Fixed(6.0)));
+
+        let bg = theme.bg_crust();
+        let rail_border_color = theme.surface0();
+        let rail_content = container(rail)
+            .width(Length::Fixed(WORKSPACE_RAIL_WIDTH))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
+
+        // Right border as a separate 1px column
+        let border_line = container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(1.0))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(rail_border_color.into()),
+                ..Default::default()
+            });
+
+        row![rail_content, border_line].into()
+    }
+
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let mut tabs_row = Row::new().spacing(4);
+        let mut tabs_row = Row::new().spacing(2);
 
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            let is_active = idx == self.active_tab;
-            let changes = tab.total_changes();
+        let (tabs, active_tab_idx) = if let Some(ws) = self.active_workspace() {
+            (ws.tabs.as_slice(), ws.active_tab)
+        } else {
+            (&[] as &[TabState], 0)
+        };
 
-            // Use terminal title if available, otherwise repo name
+        for (idx, tab) in tabs.iter().enumerate() {
+            let is_active = idx == active_tab_idx;
+
+            // Determine if this is a Claude Code tab
+            let is_claude = tab
+                .terminal_title
+                .as_ref()
+                .map(|t| t.to_lowercase().contains("claude"))
+                .unwrap_or(false);
+
+            // Icon prefix
+            let icon_str = if is_claude { "✦ " } else { "▶ " };
+            let icon_color = if is_claude {
+                theme.peach()
+            } else {
+                theme.success()
+            };
+
+            // Tab label - truncate at 20 chars
             let base_title = tab
                 .terminal_title
                 .as_ref()
                 .map(|t| {
-                    // Truncate long titles
-                    if t.len() > 25 {
-                        format!("{}...", &t[..22])
+                    if t.len() > 20 {
+                        format!("{}…", &t[..19])
                     } else {
                         t.clone()
                     }
                 })
                 .unwrap_or_else(|| tab.repo_name.clone());
 
-            // Build tab label with shortcut
-            let shortcut = if idx < 9 {
-                format!("  \u{2318}{}", idx + 1)
+            let text_color = if is_active {
+                theme.text_primary()
             } else {
-                String::new()
+                theme.overlay1()
             };
+            let active_bg = theme.bg_base();
+            let hover_bg = theme.surface0();
 
-            let tab_label = if changes > 0 {
-                format!("{} ({}){}", base_title, changes, shortcut)
-            } else {
-                format!("{}{}", base_title, shortcut)
-            };
+            // Build tab content: icon + label + shortcut
+            let mut tab_content = Row::new().spacing(0).align_y(iced::Alignment::Center);
+            tab_content = tab_content.push(text(icon_str).size(12).color(icon_color));
+            tab_content = tab_content.push(
+                text(base_title)
+                    .size(13)
+                    .color(text_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
 
-            let tab_btn = button(text(tab_label).size(13))
-                .style(if is_active {
-                    button::primary
-                } else {
-                    button::secondary
+            if idx < 9 {
+                tab_content = tab_content.push(
+                    text(format!(" \u{2318}{}", idx + 1))
+                        .size(10)
+                        .color(theme.surface2())
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            }
+
+            let tab_btn = button(tab_content)
+                .style(move |_theme, status| {
+                    let bg = if is_active {
+                        Some(active_bg.into())
+                    } else if matches!(status, button::Status::Hovered) {
+                        Some(hover_bg.into())
+                    } else {
+                        Some(iced::Color::TRANSPARENT.into())
+                    };
+                    button::Style {
+                        background: bg,
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        text_color: iced::Color::WHITE,
+                        ..Default::default()
+                    }
                 })
-                .padding([6, 12])
+                .padding([4, 10])
                 .on_press(Event::TabSelect(idx));
 
-            let close_btn = button(text("x").size(13).color(theme.text_secondary()))
-                .style(button::text)
-                .padding([6, 8])
+            // Close button
+            let close_color = theme.overlay0();
+            let close_hover = theme.text_primary();
+            let close_btn = button(text("\u{00d7}").size(14).color(close_color))
+                .style(move |_theme, status| {
+                    let tc = if matches!(status, button::Status::Hovered) {
+                        close_hover
+                    } else {
+                        close_color
+                    };
+                    button::Style {
+                        background: Some(iced::Color::TRANSPARENT.into()),
+                        text_color: tc,
+                        ..Default::default()
+                    }
+                })
+                .padding([4, 4])
                 .on_press(Event::TabClose(idx));
 
-            tabs_row = tabs_row.push(row![tab_btn, close_btn].spacing(0));
+            tabs_row = tabs_row
+                .push(row![tab_btn, close_btn].spacing(0).align_y(iced::Alignment::Center));
         }
 
-        let add_btn = button(text("+").size(14))
-            .style(button::secondary)
-            .padding([6, 12])
+        // Add tab button
+        let add_color = theme.overlay0();
+        let add_hover = theme.text_primary();
+        let add_btn = button(text("+").size(14).color(add_color))
+            .style(move |_theme, status| {
+                let tc = if matches!(status, button::Status::Hovered) {
+                    add_hover
+                } else {
+                    add_color
+                };
+                button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    text_color: tc,
+                    ..Default::default()
+                }
+            })
+            .padding([4, 8])
             .on_press(Event::OpenFolder);
-
         tabs_row = tabs_row.push(add_btn);
 
-        let bg = theme.bg_base();
-        container(tabs_row.padding(4).spacing(8).align_y(iced::Alignment::Center))
+        // Right side: spacer + workspace name + branch
+        tabs_row = tabs_row.push(iced::widget::Space::new().width(Length::Fill));
+
+        if let Some(ws) = self.active_workspace() {
+            let ws_color = ws.color.color(theme);
+            tabs_row = tabs_row.push(
+                text(&ws.name)
+                    .size(12)
+                    .color(ws_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+
+            if let Some(tab) = self.active_tab() {
+                tabs_row = tabs_row.push(
+                    text(format!("  \u{e0a0} {}", tab.branch_name))
+                        .size(12)
+                        .color(theme.overlay0())
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            }
+        }
+
+        let bg = theme.bg_crust();
+        let border_color = theme.surface0();
+        let tab_container = container(
+            tabs_row
+                .padding([4, 8])
+                .align_y(iced::Alignment::Center),
+        )
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(bg.into()),
             ..Default::default()
-        })
-        .into()
+        });
+
+        // Bottom border as separator
+        let separator = container(iced::widget::Space::new().height(0))
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(border_color.into()),
+                ..Default::default()
+            });
+
+        column![tab_container, separator].into()
     }
 
     fn view_content(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_tab() {
             let sidebar = self.view_sidebar(tab);
 
             let main_panel = if tab.viewing_file_path.is_some() {
@@ -2224,46 +3429,114 @@ _gitterm_set_title
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let git_style = if tab.sidebar_mode == SidebarMode::Git {
-            button::primary
-        } else {
-            button::secondary
-        };
-        let files_style = if tab.sidebar_mode == SidebarMode::Files {
-            button::primary
-        } else {
-            button::secondary
-        };
-
-        let changes = tab.total_changes();
-        let git_label = if changes > 0 {
-            format!("Git ({})", changes)
-        } else {
-            "Git".to_string()
-        };
-
-        let bg = theme.bg_base();
         let font = self.ui_font();
-        container(
-            row![
-                button(text(git_label).size(font))
-                    .style(git_style)
-                    .padding([4, 12])
-                    .on_press(Event::ToggleSidebarMode),
-                button(text("Files").size(font))
-                    .style(files_style)
-                    .padding([4, 12])
-                    .on_press(Event::ToggleSidebarMode),
-            ]
-            .spacing(4),
-        )
-        .padding(8)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        })
-        .into()
+        let changes = tab.total_changes();
+
+        let git_active = tab.sidebar_mode == SidebarMode::Git;
+        let files_active = tab.sidebar_mode == SidebarMode::Files;
+        let surface0 = theme.surface0();
+
+        // Git button with optional badge
+        let git_text_color = if git_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+
+        let mut git_content: Row<'_, Event, Theme, iced::Renderer> =
+            Row::new().spacing(4).align_y(iced::Alignment::Center);
+        git_content = git_content.push(text("Git").size(font).color(git_text_color));
+
+        if changes > 0 {
+            let badge_bg = iced::Color {
+                a: 0.2,
+                ..theme.warning()
+            };
+            let warning_color = theme.warning();
+            let badge = container(text(format!("{}", changes)).size(10).color(warning_color))
+                .padding([1, 6])
+                .style(move |_| container::Style {
+                    background: Some(badge_bg.into()),
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            git_content = git_content.push(badge);
+        }
+
+        let git_btn = button(git_content)
+            .style(move |_theme, status| {
+                let bg = if git_active {
+                    Some(surface0.into())
+                } else if matches!(status, button::Status::Hovered) {
+                    Some(surface0.into())
+                } else {
+                    Some(iced::Color::TRANSPARENT.into())
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    text_color: git_text_color,
+                    ..Default::default()
+                }
+            })
+            .padding([4, 12])
+            .on_press(Event::ToggleSidebarMode);
+
+        // Files button
+        let files_text_color = if files_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+
+        let files_btn = button(text("Files").size(font).color(files_text_color))
+            .style(move |_theme, status| {
+                let bg = if files_active {
+                    Some(surface0.into())
+                } else if matches!(status, button::Status::Hovered) {
+                    Some(surface0.into())
+                } else {
+                    Some(iced::Color::TRANSPARENT.into())
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    text_color: files_text_color,
+                    ..Default::default()
+                }
+            })
+            .padding([4, 12])
+            .on_press(Event::ToggleSidebarMode);
+
+        let bg = theme.bg_crust();
+        let border_color = theme.surface0();
+
+        let toggle_row = container(row![git_btn, files_btn].spacing(4))
+            .padding(8)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
+
+        let separator = container(iced::widget::Space::new().height(0))
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(border_color.into()),
+                ..Default::default()
+            });
+
+        column![toggle_row, separator].into()
     }
 
     fn view_file_tree<'a>(
@@ -2932,20 +4205,42 @@ _gitterm_set_title
         let font = self.ui_font();
         let mut content = Column::new().spacing(8).padding(8);
 
-        // Only show branch name if this is a git repo
+        // Branch display - styled rounded container with diamond icon
         if Repository::open(&tab.repo_path).is_ok() {
-            content = content.push(
-                text(format!(" {}", tab.branch_name))
-                    .size(self.ui_font())
-                    .color(theme.accent()),
-            );
+            let branch_bg = theme.bg_base();
+            let mauve = theme.mauve();
+            let branch_container = container(
+                row![
+                    text("\u{25c6}").size(font).color(mauve),
+                    text(&tab.branch_name)
+                        .size(font)
+                        .color(mauve)
+                        .font(iced::Font::with_name("Menlo")),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([4, 10])
+            .style(move |_| container::Style {
+                background: Some(branch_bg.into()),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            content = content.push(branch_container);
         }
 
         if !tab.staged.is_empty() {
             content = content.push(
-                text(format!("Staged ({})", tab.staged.len()))
-                    .size(font)
-                    .color(theme.success()),
+                row![
+                    text("S T A G E D").size(10).color(theme.overlay0()),
+                    text(format!("{}", tab.staged.len()))
+                        .size(10)
+                        .color(theme.success()),
+                ]
+                .spacing(6),
             );
             for file in &tab.staged {
                 content = content.push(self.view_file_item(file, tab));
@@ -2954,9 +4249,13 @@ _gitterm_set_title
 
         if !tab.unstaged.is_empty() {
             content = content.push(
-                text(format!("Unstaged ({})", tab.unstaged.len()))
-                    .size(font)
-                    .color(theme.warning()),
+                row![
+                    text("U N S T A G E D").size(10).color(theme.overlay0()),
+                    text(format!("{}", tab.unstaged.len()))
+                        .size(10)
+                        .color(theme.warning()),
+                ]
+                .spacing(6),
             );
             for file in &tab.unstaged {
                 content = content.push(self.view_file_item(file, tab));
@@ -2965,9 +4264,13 @@ _gitterm_set_title
 
         if !tab.untracked.is_empty() {
             content = content.push(
-                text(format!("Untracked ({})", tab.untracked.len()))
-                    .size(font)
-                    .color(theme.text_secondary()),
+                row![
+                    text("U N T R A C K E D").size(10).color(theme.overlay0()),
+                    text(format!("{}", tab.untracked.len()))
+                        .size(10)
+                        .color(theme.text_secondary()),
+                ]
+                .spacing(6),
             );
             for file in &tab.untracked {
                 content = content.push(self.view_file_item(file, tab));
@@ -2975,7 +4278,6 @@ _gitterm_set_title
         }
 
         if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
-            // Check if this is actually a git repo
             let msg = if Repository::open(&tab.repo_path).is_ok() {
                 "No changes"
             } else {
@@ -3210,33 +4512,19 @@ _gitterm_set_title
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        // Delay showing terminal for 500ms after tab creation to let layout settle
-        let ready = tab.created_at.elapsed() > Duration::from_millis(500);
 
         let bg = theme.bg_base();
         let terminal_view: Element<'a, Event, Theme, iced::Renderer> = if let Some(term) = &tab.terminal {
-            if ready {
-                let tab_id = tab.id;
-                container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .padding(4)
-                    .style(move |_| container::Style {
-                        background: Some(bg.into()),
-                        ..Default::default()
-                    })
-                    .into()
-            } else {
-                // Show loading state while terminal initializes
-                container(text("").size(14))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(bg.into()),
-                        ..Default::default()
-                    })
-                    .into()
-            }
+            let tab_id = tab.id;
+            container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(4)
+                .style(move |_| container::Style {
+                    background: Some(bg.into()),
+                    ..Default::default()
+                })
+                .into()
         } else {
             container(text("Terminal unavailable").size(14).color(theme.text_secondary()))
                 .width(Length::Fill)
@@ -3257,6 +4545,331 @@ _gitterm_set_title
         } else {
             terminal_view
         }
+    }
+
+    fn view_console_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let ws = match self.active_workspace() {
+            Some(ws) => ws,
+            None => {
+                return iced::widget::Space::new().width(0).height(0).into();
+            }
+        };
+        let console = &ws.console;
+
+        let header = self.view_console_header(console);
+
+        if !self.console_expanded {
+            // Collapsed: just the header bar
+            let border_color = theme.surface0();
+            return container(header)
+                .width(Length::Fill)
+                .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
+                .style(move |_| container::Style {
+                    background: None,
+                    border: iced::Border {
+                        width: 1.0,
+                        color: border_color,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into();
+        }
+
+        // Expanded: header + output area
+        let output = self.view_console_output(console);
+
+        let bg = theme.bg_crust();
+        container(
+            column![header, output]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(self.console_height))
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_console_header<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+
+        // Chevron button (toggle expand/collapse)
+        let chevron = if self.console_expanded { "\u{25BC}" } else { "\u{25B6}" };
+        let chevron_color = theme.overlay0();
+        let chevron_btn = button(
+            text(chevron).size(10).color(chevron_color)
+        )
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Color::TRANSPARENT.into()),
+            ..Default::default()
+        })
+        .padding([4, 6])
+        .on_press(Event::ConsoleToggle);
+
+        // Status dot
+        let dot_color = match console.status {
+            ConsoleStatus::Running => theme.success(),
+            ConsoleStatus::Error => theme.danger(),
+            ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => theme.overlay0(),
+        };
+        let status_dot = container(iced::widget::Space::new())
+            .width(Length::Fixed(8.0))
+            .height(Length::Fixed(8.0))
+            .style(move |_| container::Style {
+                background: Some(dot_color.into()),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        // Process name — click to edit, or show text input when editing
+        let name_element: Element<'a, Event, Theme, iced::Renderer> = if let Some(edit_val) = &self.editing_console_command {
+            let input_bg = theme.bg_base();
+            let input_border = theme.accent();
+            text_input("e.g. cargo run, bun run dev", edit_val)
+                .on_input(Event::ConsoleCommandChanged)
+                .on_submit(Event::ConsoleCommandSubmit)
+                .size(12)
+                .width(Length::Fixed(220.0))
+                .padding([3, 6])
+                .style(move |_theme, _status| text_input::Style {
+                    background: input_bg.into(),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: input_border,
+                        radius: 3.0.into(),
+                    },
+                    icon: iced::Color::TRANSPARENT,
+                    placeholder: theme.overlay0(),
+                    value: theme.text_primary(),
+                    selection: theme.accent(),
+                })
+                .into()
+        } else {
+            let process_name = console.run_command.as_deref().unwrap_or("Click to set command");
+            let name_color = if console.run_command.is_some() {
+                theme.text_primary()
+            } else {
+                theme.overlay0()
+            };
+            let hover_bg = theme.surface0();
+            button(
+                text(process_name)
+                    .size(12)
+                    .color(name_color)
+                    .font(iced::Font::with_name("Menlo"))
+            )
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) {
+                    hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                    text_color: name_color,
+                    ..Default::default()
+                }
+            })
+            .padding([2, 4])
+            .on_press(Event::ConsoleCommandEditStart)
+            .into()
+        };
+
+        // Uptime
+        let uptime = console.uptime_string();
+        let uptime_label = text(uptime)
+            .size(11)
+            .color(theme.overlay0())
+            .font(iced::Font::with_name("Menlo"));
+
+        // Spacer
+        let spacer = iced::widget::Space::new().width(Length::Fill);
+
+        // Action buttons
+        let btn_color = theme.overlay1();
+        let hover_bg = theme.surface0();
+
+        let action_btn_style = move |_theme: &Theme, status: button::Status| {
+            let bg = if matches!(status, button::Status::Hovered) {
+                hover_bg
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            button::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                text_color: btn_color,
+                ..Default::default()
+            }
+        };
+
+        // Clear button
+        let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
+            .style(action_btn_style)
+            .padding([2, 6])
+            .on_press(Event::ConsoleClearOutput);
+
+        // Restart button
+        let restart_btn = button(text("\u{21BB}").size(12).color(btn_color))
+            .style(action_btn_style)
+            .padding([2, 6])
+            .on_press(Event::ConsoleRestart);
+
+        // Stop/Start button
+        let stop_start_btn = if console.is_running() {
+            let stop_color = theme.danger();
+            button(text("\u{25A0}").size(12).color(stop_color))
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                        text_color: stop_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 6])
+                .on_press(Event::ConsoleStop)
+        } else {
+            let start_color = theme.success();
+            button(text("\u{25B6}").size(12).color(start_color))
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                        text_color: start_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 6])
+                .on_press_maybe(if console.run_command.is_some() { Some(Event::ConsoleStart) } else { None })
+        };
+
+        let header_bg = theme.bg_surface();
+        let top_border = theme.surface0();
+
+        container(
+            row![
+                chevron_btn,
+                status_dot,
+                name_element,
+                uptime_label,
+                spacer,
+                clear_btn,
+                restart_btn,
+                stop_start_btn,
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .padding([0, 8]),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
+        .center_y(Length::Fixed(CONSOLE_HEADER_HEIGHT))
+        .style(move |_| container::Style {
+            background: Some(header_bg.into()),
+            border: iced::Border {
+                width: 1.0,
+                color: top_border,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_console_output<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+
+        if console.output_lines.is_empty() {
+            // Show hint text
+            let hint = if console.run_command.is_none() {
+                "No command configured for this workspace"
+            } else if console.status == ConsoleStatus::Stopped || console.status == ConsoleStatus::NoneConfigured {
+                "Press \u{25B6} to start"
+            } else {
+                "Waiting for output..."
+            };
+
+            let bg = theme.bg_crust();
+            return container(
+                text(hint)
+                    .size(12)
+                    .color(theme.overlay0())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into();
+        }
+
+        let timestamp_color = theme.surface2();
+        let text_color = color!(0xa6adc8); // subtext0
+        let stderr_color = theme.danger();
+
+        let mut output_col = Column::new().spacing(0).padding([4, 8]);
+
+        for line in &console.output_lines {
+            let ts = text(&line.timestamp)
+                .size(10)
+                .color(timestamp_color)
+                .font(iced::Font::with_name("Menlo"));
+
+            let content_color = if line.is_stderr { stderr_color } else { text_color };
+            let content = text(&line.content)
+                .size(11)
+                .color(content_color)
+                .font(iced::Font::with_name("Menlo"));
+
+            output_col = output_col.push(
+                row![ts, content]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Start),
+            );
+        }
+
+        let bg = theme.bg_crust();
+        container(
+            scrollable(output_col)
+                .anchor_bottom()
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     fn view_search_bar<'a>(

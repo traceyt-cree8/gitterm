@@ -24,6 +24,8 @@ pub struct FileSnapshot {
 pub struct ServerState {
     pub terminals: Arc<RwLock<HashMap<usize, TerminalSnapshot>>>,
     pub files: Arc<RwLock<HashMap<usize, FileSnapshot>>>,
+    pub shutdown: Arc<tokio::sync::Notify>,
+    pub bound_port: Arc<std::sync::Mutex<Option<u16>>>,
 }
 
 impl ServerState {
@@ -31,12 +33,37 @@ impl ServerState {
         Self {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             files: Arc::new(RwLock::new(HashMap::new())),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            bound_port: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Get the base URL of the log server, if it's running
+    pub fn base_url(&self) -> Option<String> {
+        self.bound_port
+            .lock()
+            .ok()
+            .and_then(|port| port.map(|p| format!("http://localhost:{}", p)))
     }
 }
 
-/// Start the HTTP log server on localhost:3030
+/// Find an available port, trying 3030-3039 first, then OS-assigned
+fn find_available_port() -> u16 {
+    for port in 3030..3040 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    // Fallback: let OS assign a port
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to any port");
+    listener.local_addr().unwrap().port()
+}
+
+/// Start the HTTP log server with graceful shutdown
 pub async fn start_server(state: ServerState) {
+    let shutdown = state.shutdown.clone();
+    let bound_port = state.bound_port.clone();
     let state_filter = warp::any().map(move || state.clone());
 
     // Route: GET / - List all tabs
@@ -56,8 +83,21 @@ pub async fn start_server(state: ServerState) {
 
     let routes = index.or(tab).or(file);
 
-    println!("🌐 Log server started at http://localhost:3030");
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    let port = find_available_port();
+
+    let (_addr, server) = warp::serve(routes)
+        .bind_with_graceful_shutdown(([127, 0, 0, 1], port), async move {
+            shutdown.notified().await;
+        });
+
+    // Store the actual port so the app can reference it
+    if let Ok(mut p) = bound_port.lock() {
+        *p = Some(port);
+    }
+
+    println!("Log server started at http://localhost:{}", port);
+    server.await;
+    println!("Log server shut down");
 }
 
 /// Handler for index page - lists all tabs
