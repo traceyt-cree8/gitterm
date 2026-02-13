@@ -642,6 +642,7 @@ struct ConsoleState {
     output_lines: Vec<ConsoleOutputLine>,
     output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ConsoleOutputMessage>>,
     child_killer: Option<tokio::sync::oneshot::Sender<()>>,
+    detected_url: Option<String>,
 }
 
 impl ConsoleState {
@@ -660,10 +661,17 @@ impl ConsoleState {
             output_lines: Vec::new(),
             output_rx: None,
             child_killer: None,
+            detected_url: None,
         }
     }
 
     fn push_line(&mut self, content: String, is_stderr: bool) {
+        // Detect URLs/ports in output (only if we haven't found one yet)
+        if self.detected_url.is_none() {
+            if let Some(url) = Self::detect_url(&content) {
+                self.detected_url = Some(url);
+            }
+        }
         let now = chrono::Local::now();
         self.output_lines.push(ConsoleOutputLine {
             timestamp: now.format("%H:%M:%S").to_string(),
@@ -675,6 +683,63 @@ impl ConsoleState {
             let drain_count = self.output_lines.len() - MAX_CONSOLE_LINES;
             self.output_lines.drain(..drain_count);
         }
+    }
+
+    /// Strip ANSI escape sequences from a string.
+    fn strip_ansi(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip ESC [ ... (single letter terminator)
+                if let Some(next) = chars.next() {
+                    if next == '[' {
+                        // Consume until we hit a letter (the terminator)
+                        for tc in chars.by_ref() {
+                            if tc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    // Otherwise skip just the ESC + next char
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    /// Scan a line of console output for a URL or port pattern.
+    fn detect_url(line: &str) -> Option<String> {
+        let clean = Self::strip_ansi(line);
+        // Match explicit URLs: http://localhost:3000, http://127.0.0.1:8080, etc.
+        if let Some(start) = clean.find("http://") {
+            let url = &clean[start..];
+            let end = url.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+                .unwrap_or(url.len());
+            return Some(url[..end].to_string());
+        }
+        if let Some(start) = clean.find("https://localhost") {
+            let url = &clean[start..];
+            let end = url.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+                .unwrap_or(url.len());
+            return Some(url[..end].to_string());
+        }
+        // Match "listening on :3000" or "port 3000" patterns
+        let lower = clean.to_lowercase();
+        for pattern in &["listening on :", "port ", "on port "] {
+            if let Some(pos) = lower.find(pattern) {
+                let after = &clean[pos + pattern.len()..];
+                let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(port) = port_str.parse::<u16>() {
+                    if port > 0 {
+                        return Some(format!("http://localhost:{}", port));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn clear_output(&mut self) {
@@ -1560,6 +1625,7 @@ pub enum Event {
     ConsoleStop,
     ConsoleRestart,
     ConsoleClearOutput,
+    ConsoleOpenBrowser,
     ConsoleDividerDragStart,
     ConsoleCommandEditStart,
     ConsoleCommandChanged(String),
@@ -3076,6 +3142,7 @@ _gitterm_set_title
                     let dir = ws.active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
+                    ws.console.detected_url = None;
                     ws.console.spawn_process(&dir);
                 }
                 self.console_expanded = true;
@@ -3089,6 +3156,7 @@ _gitterm_set_title
             Event::ConsoleRestart => {
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.console.kill_process();
+                    ws.console.detected_url = None;
                     let dir = ws.active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
@@ -3099,6 +3167,13 @@ _gitterm_set_title
             Event::ConsoleClearOutput => {
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.console.clear_output();
+                }
+            }
+            Event::ConsoleOpenBrowser => {
+                if let Some(ws) = self.active_workspace() {
+                    if let Some(url) = &ws.console.detected_url {
+                        let _ = std::process::Command::new("open").arg(url).spawn();
+                    }
                 }
             }
             Event::ConsoleDividerDragStart => {
@@ -5444,6 +5519,31 @@ _gitterm_set_title
             }
         };
 
+        // Open in browser button (only visible when a URL is detected)
+        let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> = if console.detected_url.is_some() {
+            let link_color = theme.accent();
+            let hover_bg_browser = theme.surface0();
+            Some(button(text("\u{1F517}").size(12).color(link_color))
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        hover_bg_browser
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                        text_color: link_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 6])
+                .on_press(Event::ConsoleOpenBrowser)
+                .into())
+        } else {
+            None
+        };
+
         // Clear button
         let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
             .style(action_btn_style)
@@ -5498,21 +5598,24 @@ _gitterm_set_title
         let header_bg = theme.bg_surface();
         let top_border = theme.surface0();
 
-        container(
-            row![
-                chevron_btn,
-                status_dot,
-                name_element,
-                uptime_label,
-                spacer,
-                clear_btn,
-                restart_btn,
-                stop_start_btn,
-            ]
+        let mut header_row = Row::new()
             .spacing(6)
             .align_y(iced::Alignment::Center)
-            .padding([0, 8]),
-        )
+            .padding([0, 8])
+            .push(chevron_btn)
+            .push(status_dot)
+            .push(name_element)
+            .push(uptime_label)
+            .push(spacer);
+        if let Some(btn) = browser_btn {
+            header_row = header_row.push(btn);
+        }
+        header_row = header_row
+            .push(clear_btn)
+            .push(restart_btn)
+            .push(stop_start_btn);
+
+        container(header_row)
         .width(Length::Fill)
         .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
         .center_y(Length::Fixed(CONSOLE_HEADER_HEIGHT))
