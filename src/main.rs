@@ -1621,7 +1621,12 @@ fn tab_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("tab-bar-scroll")
 }
 
+fn workspace_bar_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("ws-bar-scroll")
+}
+
 const ESTIMATED_TAB_WIDTH: f32 = 200.0;
+const ESTIMATED_WS_BTN_WIDTH: f32 = 180.0;
 
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
@@ -1646,6 +1651,16 @@ impl App {
         iced::advanced::widget::operate(
             iced::advanced::widget::operation::scrollable::scroll_to(
                 tab_scrollable_id().into(),
+                scrollable::AbsoluteOffset { x: Some(target_x), y: None },
+            ),
+        )
+    }
+
+    fn scroll_to_active_workspace_bar(&self) -> Task<Event> {
+        let target_x = (self.active_workspace_idx as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::scrollable::scroll_to(
+                workspace_bar_scrollable_id().into(),
                 scrollable::AbsoluteOffset { x: Some(target_x), y: None },
             ),
         )
@@ -2899,12 +2914,14 @@ _gitterm_set_title
                     self.save_workspaces();
 
                     // Set scrollable to starting position for the animation
-                    return iced::advanced::widget::operate(
+                    let slide_task = iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
                             workspace_scrollable_id().into(),
                             scrollable::AbsoluteOffset { x: Some(self.slide_start_offset), y: None },
                         ),
                     );
+                    let bar_task = self.scroll_to_active_workspace_bar();
+                    return Task::batch([slide_task, bar_task]);
                 }
             }
             Event::SlideAnimationTick => {
@@ -3500,7 +3517,36 @@ _gitterm_set_title
         .on_press(Event::WorkspaceCreate);
         bar_row = bar_row.push(ws_add_btn);
 
-        bar_row = bar_row.push(iced::widget::Space::new().width(Length::Fill));
+        let scrollable_bar = scrollable(
+            bar_row.padding([0, 4]).align_y(iced::Alignment::Center),
+        )
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .id(workspace_bar_scrollable_id())
+        .width(Length::Fill)
+        .style(|_theme, _status| {
+            let transparent_rail = scrollable::Rail {
+                background: None,
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    background: iced::Color::TRANSPARENT.into(),
+                    border: iced::Border::default(),
+                },
+            };
+            scrollable::Style {
+                container: container::Style::default(),
+                vertical_rail: transparent_rail,
+                horizontal_rail: transparent_rail,
+                gap: None,
+                auto_scroll: scrollable::AutoScroll {
+                    background: iced::Color::TRANSPARENT.into(),
+                    border: iced::Border::default(),
+                    shadow: iced::Shadow::default(),
+                    icon: iced::Color::TRANSPARENT,
+                },
+            }
+        });
 
         let bg = theme.bg_crust();
         let top_border_color = theme.surface0();
@@ -3513,14 +3559,12 @@ _gitterm_set_title
                 ..Default::default()
             });
 
-        let bar_container = container(
-            bar_row.padding([0, 4]),
-        )
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        });
+        let bar_container = container(scrollable_bar)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
 
         column![top_border, bar_container].into()
     }
