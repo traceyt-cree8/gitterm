@@ -1666,6 +1666,7 @@ pub enum Event {
     AttentionJumpNext,
     // Claude tab
     NewClaudeTab,
+    ResumeClaudeTab,
     // Bottom panel tabs
     BottomTabSelect(BottomPanelTab),
     BottomTerminalAdd,
@@ -2131,8 +2132,6 @@ fi
         use iced_term::bindings::{BindingAction, InputKind, KeyboardBinding as Binding};
         let mut bindings = vec![
             (Binding { target: InputKind::Char("`".to_string()), modifiers: Modifiers::CTRL, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
-            (Binding { target: InputKind::Char("c".to_string()), modifiers: Modifiers::CTRL | Modifiers::SHIFT, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
-            (Binding { target: InputKind::Char("C".to_string()), modifiers: Modifiers::CTRL | Modifiers::SHIFT, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
         ];
         for n in 1..=9u8 {
             bindings.push((
@@ -2476,6 +2475,17 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::ResumeClaudeTab => {
+                // Create a new tab that resumes the last Claude Code session
+                if let Some(ws) = self.active_workspace() {
+                    let dir = ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    self.add_tab_with_command(dir, Some("claude --resume".to_string()));
+                    self.save_workspaces();
+                    return self.scroll_to_active_tab();
+                }
+            }
             Event::BottomTabSelect(tab) => {
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.active_bottom_tab = tab;
@@ -2710,14 +2720,23 @@ fi
                 }
 
                 // Ctrl+backtick — jump to next attention tab
-                // Ctrl+Shift+C — new Claude Code tab
                 if modifiers.control() && !modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
                         if c == "`" {
                             return Task::done(Event::AttentionJumpNext);
                         }
-                        if (c == "c" || c == "C") && modifiers.shift() {
-                            return Task::done(Event::NewClaudeTab);
+                    }
+                }
+
+                // Cmd+Shift+C — resume Claude Code session
+                // Cmd+Shift+T — new plain terminal tab (folder picker)
+                if modifiers.command() && modifiers.shift() {
+                    if let Key::Character(c) = key.as_ref() {
+                        if c == "c" || c == "C" {
+                            return Task::done(Event::ResumeClaudeTab);
+                        }
+                        if c == "t" || c == "T" {
+                            return Task::done(Event::OpenFolder);
                         }
                     }
                 }
@@ -3292,7 +3311,7 @@ fi
                 let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
                 let color = WorkspaceColor::next_available(&used_colors);
                 let mut workspace = Workspace::new(name, path.clone(), color);
-                self.add_tab_to_workspace(&mut workspace, path);
+                self.add_tab_to_workspace_with_command(&mut workspace, path, Some("claude".to_string()));
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
                 self.save_workspaces();
@@ -4031,7 +4050,7 @@ fi
                 }
             })
             .padding([4, 8])
-            .on_press(Event::OpenFolder);
+            .on_press(Event::NewClaudeTab);
         tabs_row = tabs_row.push(add_btn);
 
         // Wrap tabs in a horizontal scrollable
