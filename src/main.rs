@@ -929,6 +929,8 @@ struct TabState {
     webview_content: Option<String>,
     // Search state
     search: SearchState,
+    // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
+    needs_attention: bool,
 }
 
 impl TabState {
@@ -963,6 +965,7 @@ impl TabState {
             image_handle: None,
             webview_content: None,
             search: SearchState::default(),
+            needs_attention: false,
         }
     }
 
@@ -1381,17 +1384,21 @@ impl WorkspaceColor {
         }
     }
 
+    const ALL: [Self; 8] = [
+        Self::Lavender, Self::Blue, Self::Green, Self::Peach,
+        Self::Pink, Self::Yellow, Self::Red, Self::Teal,
+    ];
+
     fn from_index(idx: usize) -> Self {
-        match idx % 8 {
-            0 => Self::Lavender,
-            1 => Self::Blue,
-            2 => Self::Green,
-            3 => Self::Peach,
-            4 => Self::Pink,
-            5 => Self::Yellow,
-            6 => Self::Red,
-            _ => Self::Teal,
-        }
+        Self::ALL[idx % Self::ALL.len()]
+    }
+
+    /// Pick the first color not already used by existing workspaces
+    fn next_available(used: &[Self]) -> Self {
+        Self::ALL.iter()
+            .find(|c| !used.contains(c))
+            .copied()
+            .unwrap_or_else(|| Self::from_index(used.len()))
     }
 }
 
@@ -1435,6 +1442,14 @@ impl Workspace {
 
     fn active_tab_mut(&mut self) -> Option<&mut TabState> {
         self.tabs.get_mut(self.active_tab)
+    }
+
+    fn attention_count(&self) -> usize {
+        self.tabs.iter().filter(|t| t.needs_attention).count()
+    }
+
+    fn has_attention(&self) -> bool {
+        self.tabs.iter().any(|t| t.needs_attention)
     }
 }
 
@@ -1550,6 +1565,11 @@ pub enum Event {
     ConsoleCommandChanged(String),
     ConsoleCommandSubmit,
     ConsoleCommandCancel,
+    // Attention system events
+    AttentionPulseTick,
+    AttentionJumpNext,
+    // Modifier tracking
+    ModifiersChanged(Modifiers),
 }
 
 struct App {
@@ -1581,6 +1601,10 @@ struct App {
     // Edge peek state
     edge_peek_left: bool,
     edge_peek_right: bool,
+    // Attention pulse animation (toggles every 500ms)
+    attention_pulse_bright: bool,
+    // Track modifier state for filtering terminal writes
+    current_modifiers: Modifiers,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -1742,6 +1766,8 @@ impl App {
             last_user_scroll: None,
             edge_peek_left: false,
             edge_peek_right: false,
+            attention_pulse_bright: false,
+            current_modifiers: Modifiers::empty(),
         };
 
         // Try to restore workspaces from saved config
@@ -1872,6 +1898,10 @@ impl App {
         // This enables the sidebar to sync with terminal directory changes
         env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
 
+        // Clear Claude Code env vars so terminals aren't detected as nested sessions
+        env.insert("CLAUDECODE".to_string(), String::new());
+        env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), String::new());
+
         // Determine shell type for the right initialization
         let is_zsh = shell.contains("zsh");
         let is_bash = shell.contains("bash");
@@ -1934,7 +1964,34 @@ _gitterm_set_title
             },
         };
 
-        if let Ok(terminal) = iced_term::Terminal::new(id as u64, term_settings) {
+        if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, term_settings) {
+            // Register Noop bindings for keys we handle as app shortcuts
+            // so the terminal doesn't type characters for them
+            let mut noop_bindings = vec![
+                // Ctrl+` — AttentionJumpNext
+                (
+                    iced_term::bindings::Binding {
+                        target: iced_term::bindings::InputKind::Char("`".to_string()),
+                        modifiers: Modifiers::CTRL,
+                        terminal_mode_include: iced_term::TermMode::empty(),
+                        terminal_mode_exclude: iced_term::TermMode::empty(),
+                    },
+                    iced_term::bindings::BindingAction::Noop,
+                ),
+            ];
+            // Ctrl+1-9 — workspace switching
+            for n in 1..=9u8 {
+                noop_bindings.push((
+                    iced_term::bindings::Binding {
+                        target: iced_term::bindings::InputKind::Char(n.to_string()),
+                        modifiers: Modifiers::CTRL,
+                        terminal_mode_include: iced_term::TermMode::empty(),
+                        terminal_mode_exclude: iced_term::TermMode::empty(),
+                    },
+                    iced_term::bindings::BindingAction::Noop,
+                ));
+            }
+            terminal.handle(iced_term::Command::AddBindings(noop_bindings));
             tab.terminal = Some(terminal);
         }
 
@@ -1963,6 +2020,10 @@ _gitterm_set_title
         self.active_workspace_mut().and_then(|ws| ws.active_tab_mut())
     }
 
+    fn any_tab_needs_attention(&self) -> bool {
+        self.workspaces.iter().any(|ws| ws.has_attention())
+    }
+
     fn title(&self) -> String {
         if let Some(ws) = self.active_workspace() {
             if let Some(tab) = ws.active_tab() {
@@ -1981,6 +2042,9 @@ _gitterm_set_title
             // Poll menu events frequently
             iced::time::every(Duration::from_millis(50)).map(|_| Event::CheckMenu),
             iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                    Some(Event::ModifiersChanged(modifiers))
+                }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key, modifiers, ..
                 }) => Some(Event::KeyPressed(key, modifiers)),
@@ -2008,6 +2072,14 @@ _gitterm_set_title
             );
         }
 
+        // Attention pulse (500ms toggle) — only when any tab needs attention
+        if self.any_tab_needs_attention() {
+            subs.push(
+                iced::time::every(Duration::from_millis(500))
+                    .map(|_| Event::AttentionPulseTick),
+            );
+        }
+
         for ws in &self.workspaces {
             for tab in &ws.tabs {
                 if let Some(term) = &tab.terminal {
@@ -2030,13 +2102,30 @@ _gitterm_set_title
                 if self.editing_console_command.is_some() {
                     return Task::none();
                 }
+                // Suppress terminal writes for keys we handle as app shortcuts (Ctrl+1-9, Ctrl+`)
+                if self.current_modifiers.control() && !self.current_modifiers.command() {
+                    if let iced_term::backend::Command::Write(ref data) = cmd {
+                        if data.len() == 1 {
+                            let b = data[0];
+                            if (b'1'..=b'9').contains(&b) || b == b'`' {
+                                return Task::none();
+                            }
+                        }
+                    }
+                }
                 if let Some(tab) = self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()).find(|t| t.id == tab_id) {
+                    // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
+                    if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention {
+                        tab.needs_attention = false;
+                    }
                     if let Some(term) = &mut tab.terminal {
                         match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
                                 tab.terminal_title = Some(title.clone());
+                                // Detect attention: Claude Code sets "*" prefix when waiting for input
+                                tab.needs_attention = title.starts_with('*');
 
                                 // Try to sync sidebar directory from terminal title
                                 if let Some(dir) = TabState::extract_dir_from_title(&title) {
@@ -2254,6 +2343,7 @@ _gitterm_set_title
                 }
             }
             Event::KeyPressed(key, modifiers) => {
+                self.current_modifiers = modifiers;
                 // Escape cancels console command editing
                 if self.editing_console_command.is_some() {
                     if let Key::Named(key::Named::Escape) = key.as_ref() {
@@ -2335,6 +2425,15 @@ _gitterm_set_title
                                 return Task::done(Event::FileSelectByIndex(last));
                             }
                             _ => {}
+                        }
+                    }
+                }
+
+                // Ctrl+backtick — jump to next attention tab
+                if modifiers.control() && !modifiers.command() {
+                    if let Key::Character(c) = key.as_ref() {
+                        if c == "`" {
+                            return Task::done(Event::AttentionJumpNext);
                         }
                     }
                 }
@@ -2904,7 +3003,8 @@ _gitterm_set_title
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Workspace".to_string());
-                let color = WorkspaceColor::from_index(self.workspaces.len());
+                let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
+                let color = WorkspaceColor::next_available(&used_colors);
                 let mut workspace = Workspace::new(name, path.clone(), color);
                 self.add_tab_to_workspace(&mut workspace, path);
                 self.workspaces.push(workspace);
@@ -2992,6 +3092,58 @@ _gitterm_set_title
             }
             Event::ConsoleCommandCancel => {
                 self.editing_console_command = None;
+            }
+            Event::ModifiersChanged(modifiers) => {
+                self.current_modifiers = modifiers;
+            }
+            Event::AttentionPulseTick => {
+                self.attention_pulse_bright = !self.attention_pulse_bright;
+            }
+            Event::AttentionJumpNext => {
+                // Round-robin search for next tab needing attention
+                let ws_count = self.workspaces.len();
+                if ws_count == 0 {
+                    return Task::none();
+                }
+                let start_ws = self.active_workspace_idx;
+                let start_tab = self.workspaces.get(start_ws)
+                    .map(|ws| ws.active_tab)
+                    .unwrap_or(0);
+
+                // Search from (current_ws, current_tab + 1), wrapping around all workspaces/tabs
+                let mut ws_idx = start_ws;
+                let mut tab_idx = start_tab + 1;
+                for _ in 0..(ws_count * 100) { // upper bound to prevent infinite loop
+                    if let Some(ws) = self.workspaces.get(ws_idx) {
+                        if tab_idx < ws.tabs.len() {
+                            if ws.tabs[tab_idx].needs_attention {
+                                // Found one — switch to it
+                                if ws_idx != self.active_workspace_idx {
+                                    // Animate workspace switch
+                                    let viewport_width = self.content_viewport_width();
+                                    let target = ws_idx as f32 * viewport_width;
+                                    self.slide_start_offset = self.slide_offset;
+                                    self.slide_target = target;
+                                    self.slide_start_time = Some(Instant::now());
+                                    self.slide_animating = true;
+                                    self.active_workspace_idx = ws_idx;
+                                }
+                                self.workspaces[ws_idx].active_tab = tab_idx;
+                                self.save_workspaces();
+                                return Task::none();
+                            }
+                            tab_idx += 1;
+                            continue;
+                        }
+                    }
+                    // Move to next workspace, first tab
+                    ws_idx = (ws_idx + 1) % ws_count;
+                    tab_idx = 0;
+                    // If we've wrapped back to start and checked past current tab, we're done
+                    if ws_idx == start_ws && tab_idx > start_tab {
+                        break;
+                    }
+                }
             }
         }
         Task::none()
@@ -3175,6 +3327,8 @@ _gitterm_set_title
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
 
+        let pulse_bright = self.attention_pulse_bright;
+
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
@@ -3182,8 +3336,20 @@ _gitterm_set_title
             let active_bg = theme.bg_base();
             let hover_bg = theme.surface0();
 
-            // Colored dot before name
-            let dot_color = if is_active { ws_color } else { theme.surface2() };
+            let attn_count = ws.attention_count();
+            let has_attention = attn_count > 0;
+            let has_error = ws.console.status == ConsoleStatus::Error;
+
+            // Colored dot before name — override for attention/error
+            let dot_color = if has_error {
+                theme.danger()
+            } else if has_attention {
+                if pulse_bright { theme.peach() } else { theme.warning() }
+            } else if is_active {
+                ws_color
+            } else {
+                theme.surface2()
+            };
             let dot = container(iced::widget::Space::new().width(0).height(0))
                 .width(Length::Fixed(6.0))
                 .height(Length::Fixed(6.0))
@@ -3201,9 +3367,36 @@ _gitterm_set_title
                 .color(text_color)
                 .font(iced::Font::with_name("Menlo"));
 
-            let btn_content = row![dot, label]
+            let mut btn_content = row![dot, label]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
+
+            // Attention/error badge
+            if has_error {
+                let badge_bg = theme.danger();
+                let badge_text_color = theme.bg_crust();
+                btn_content = btn_content.push(
+                    container(text("!").size(9).color(badge_text_color).font(iced::Font::with_name("Menlo")))
+                        .padding([0, 4])
+                        .style(move |_| container::Style {
+                            background: Some(badge_bg.into()),
+                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
+                );
+            } else if has_attention {
+                let badge_bg = theme.peach();
+                let badge_text_color = theme.bg_crust();
+                btn_content = btn_content.push(
+                    container(text(format!("{}", attn_count)).size(9).color(badge_text_color).font(iced::Font::with_name("Menlo")))
+                        .padding([0, 4])
+                        .style(move |_| container::Style {
+                            background: Some(badge_bg.into()),
+                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
+                );
+            }
 
             // Active workspace: colored top accent line above the button
             if is_active {
@@ -3312,6 +3505,7 @@ _gitterm_set_title
 
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+        let pulse_bright = self.attention_pulse_bright;
         let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
@@ -3319,8 +3513,28 @@ _gitterm_set_title
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
 
-            let (dot_w, dot_h) = if is_active { (4.0, 18.0) } else { (4.0, 4.0) };
-            let dot_color = if is_active { ws_color } else { inactive_color };
+            let has_attention = ws.has_attention();
+            let has_error = ws.console.status == ConsoleStatus::Error;
+
+            // Larger dot for attention/error when inactive
+            let (dot_w, dot_h) = if is_active {
+                (4.0, 18.0)
+            } else if has_attention || has_error {
+                (6.0, 6.0)
+            } else {
+                (4.0, 4.0)
+            };
+
+            // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
+            let dot_color = if has_error && !is_active {
+                theme.danger()
+            } else if has_attention && !is_active {
+                if pulse_bright { theme.peach() } else { theme.warning() }
+            } else if is_active {
+                ws_color
+            } else {
+                inactive_color
+            };
 
             let dot = container(iced::widget::Space::new().width(0).height(0))
                 .width(Length::Fixed(dot_w))
@@ -3418,8 +3632,11 @@ _gitterm_set_title
             (&[] as &[TabState], 0)
         };
 
+        let pulse_bright = self.attention_pulse_bright;
+
         for (idx, tab) in tabs.iter().enumerate() {
             let is_active = idx == active_tab_idx;
+            let has_attention = tab.needs_attention;
 
             // Determine if this is a Claude Code tab
             let is_claude = tab
@@ -3428,23 +3645,26 @@ _gitterm_set_title
                 .map(|t| t.to_lowercase().contains("claude"))
                 .unwrap_or(false);
 
-            // Icon prefix
-            let icon_str = if is_claude { "✦ " } else { "▶ " };
-            let icon_color = if is_claude {
-                theme.peach()
+            // Icon prefix — attention overrides normal icon
+            let (icon_str, icon_color) = if has_attention {
+                let attn_color = if pulse_bright { theme.peach() } else { theme.warning() };
+                ("● ", attn_color)
+            } else if is_claude {
+                ("✦ ", theme.peach())
             } else {
-                theme.success()
+                ("▶ ", theme.success())
             };
 
-            // Tab label - truncate at 20 chars
+            // Tab label - strip leading "*" when attention (redundant with visual indicator), truncate at 20 chars
             let base_title = tab
                 .terminal_title
                 .as_ref()
                 .map(|t| {
-                    if t.len() > 20 {
-                        format!("{}…", &t[..19])
+                    let display = if has_attention { t.trim_start_matches('*').trim_start() } else { t.as_str() };
+                    if display.len() > 20 {
+                        format!("{}…", &display[..19])
                     } else {
-                        t.clone()
+                        display.to_string()
                     }
                 })
                 .unwrap_or_else(|| tab.repo_name.clone());
@@ -3456,6 +3676,14 @@ _gitterm_set_title
             };
             let active_bg = theme.bg_base();
             let hover_bg = theme.surface0();
+
+            // Attention background colors
+            let attn_bg_color = if pulse_bright {
+                iced::Color { a: 0.20, ..theme.peach() }
+            } else {
+                iced::Color { a: 0.12, ..theme.peach() }
+            };
+            let attn_border_color = iced::Color { a: 0.5, ..theme.peach() };
 
             // Build tab content: icon + label + shortcut
             let mut tab_content = Row::new().spacing(0).align_y(iced::Alignment::Center);
@@ -3478,21 +3706,35 @@ _gitterm_set_title
 
             let tab_btn = button(tab_content)
                 .style(move |_theme, status| {
-                    let bg = if is_active {
-                        Some(active_bg.into())
-                    } else if matches!(status, button::Status::Hovered) {
-                        Some(hover_bg.into())
-                    } else {
-                        Some(iced::Color::TRANSPARENT.into())
-                    };
-                    button::Style {
-                        background: bg,
-                        border: iced::Border {
-                            radius: 6.0.into(),
+                    if has_attention {
+                        // Attention style takes priority
+                        button::Style {
+                            background: Some(attn_bg_color.into()),
+                            border: iced::Border {
+                                radius: 6.0.into(),
+                                color: attn_border_color,
+                                width: 1.0,
+                            },
+                            text_color: iced::Color::WHITE,
                             ..Default::default()
-                        },
-                        text_color: iced::Color::WHITE,
-                        ..Default::default()
+                        }
+                    } else {
+                        let bg = if is_active {
+                            Some(active_bg.into())
+                        } else if matches!(status, button::Status::Hovered) {
+                            Some(hover_bg.into())
+                        } else {
+                            Some(iced::Color::TRANSPARENT.into())
+                        };
+                        button::Style {
+                            background: bg,
+                            border: iced::Border {
+                                radius: 6.0.into(),
+                                ..Default::default()
+                            },
+                            text_color: iced::Color::WHITE,
+                            ..Default::default()
+                        }
                     }
                 })
                 .padding([4, 10])

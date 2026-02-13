@@ -1,38 +1,32 @@
 # Resume: gitterm-v2
 
-**Last checkpoint:** 2026-02-12
+**Last checkpoint:** 2026-02-12 evening
 
-## Project Context
+## You Were Just Working On
+Implemented the **Attention System** (Phase 2) and tested it interactively. All features working — ready to commit.
 
-This is a fork of `gitterm` (the user's daily-driver terminal app) created specifically to build the **workspace system** and related features. The original repo at `/Users/t.trewin/GitRepo/gitterm` must remain untouched — the user runs that version all day.
+**Just did:** Fixed Ctrl+1-9 and Ctrl+` writing stray characters into the terminal by adding modifier tracking and write suppression in the BackendCall handler.
 
-## What Was Decided
+**Immediate next step:** Commit all changes (attention system, Noop binding, write suppression, color dedup, CLAUDECODE env fix). Then move on to Phase 3 (Tab Overflow) or Phase 4 (Console Panel) from `design/WORKSPACE_DESIGN.md`.
 
-Full design spec is at `design/WORKSPACE_DESIGN.md` with HTML mockup at `design/workspace-mockup.html`.
+## Completed This Session
+- **Attention system (Phase 2):** Full implementation — `needs_attention` field on TabState, detection via terminal title `*` prefix, auto-clear on user input
+- **Pulsing animation:** 500ms subscription timer, `attention_pulse_bright` toggle on App, conditional subscription (only active when attention exists)
+- **Tab bar indicators:** Pulsing amber `●` icon, stripped `*` prefix from title, amber-tinted background with border for attention tabs
+- **Workspace bar indicators:** Pulsing amber dot for workspaces with attention, amber badge showing attention count, red `!` badge for console errors
+- **Spine indicators:** Larger dots (6x6) for workspaces with attention/error, pulsing amber or red color
+- **Ctrl+` shortcut:** Round-robin jump to next attention tab across all workspaces, with slide animation
+- **iced_term `Noop` binding:** Added new `BindingAction::Noop` variant to iced_term_fork to suppress terminal character output for app shortcuts
+- **Write suppression:** Modifier tracking via `ModifiersChanged` events + BackendCall filtering to prevent Ctrl+1-9 and Ctrl+` from typing into terminal
+- **Workspace color dedup:** `WorkspaceColor::next_available()` picks first unused color instead of `from_index(len)`
+- **CLAUDECODE env fix:** Clear `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars in PTY setup so Claude Code can launch inside GitTerm terminals
 
-Four features to build:
-1. **Workspace System** — Left rail (48px), 2-letter abbreviation buttons, `Ctrl+1/2/3` to switch, tabs grouped by project
-2. **Attention System** — Detect `*` in terminal title, amber tab styling, badges on workspace rail, `Ctrl+backtick` to jump to next attention tab
-3. **Console Panel** — Always-visible bottom panel for workspace run command (dev server), not a tab. Start/stop/restart controls, auto-expand on error, `Cmd+J` toggle
-4. **Tab Overflow** — Scrollable tab bar with overflow indicator showing hidden tab count + attention count
+## Key Files
+- `src/main.rs` — All app changes (attention fields, events, detection, UI indicators, write suppression)
+- `../iced_term_fork/src/bindings.rs` — Added `Noop` variant to `BindingAction` enum
+- `../iced_term_fork/src/view.rs` — Added `Noop` handler (returns None, no character written)
+- `design/WORKSPACE_DESIGN.md` — Full design spec for all phases
 
-## Current Codebase Notes
-
-- **Single file architecture**: `src/main.rs` (~3300 lines) contains almost everything
-- **Key structs**: `App` holds `Vec<TabState>` + `active_tab` index — this needs to become `Vec<Workspace>`
-- **Tab bar**: `view_tab_bar()` at line ~2062, simple `Row` with no scroll/overflow handling
-- **Terminal titles**: Captured via `ChangeTitle` event at line ~1358, stored in `tab.terminal_title`
-- **Config**: Persisted to `~/.config/gitterm/config.json`, loaded on startup
-- **Log server**: `src/log_server.rs` — HTTP server at :3030 for terminal output
-- **Markdown**: `src/markdown.rs` — markdown rendering with Mermaid support
-- **Theme**: Catppuccin Mocha (dark) / Latte (light), colors defined as methods on `AppTheme`
-
-## To Resume
-
-Start with **Phase 1: Foundation** from the design doc:
-1. Refactor `App` to hold `Vec<Workspace>` wrapping the existing `Vec<TabState>`
-2. Add workspace rail UI
-3. Workspace switching
-4. Persistence
-
-Read `design/WORKSPACE_DESIGN.md` first for the full spec.
+## Blockers/Issues
+- None — all features working and tested
+- Pre-existing warnings only: `tab_id` dead code in log_server.rs, `_viewport` in iced_term view.rs
