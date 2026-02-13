@@ -2698,6 +2698,10 @@ fi
                         if (c == "r" || c == "R") && modifiers.shift() {
                             return Task::done(Event::ConsoleRestart);
                         }
+                        // Cmd+Shift+W - Close current workspace
+                        if (c == "w" || c == "W") && modifiers.shift() {
+                            return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
+                        }
                     }
                 }
 
@@ -3668,6 +3672,7 @@ fi
         content_col = content_col.push(shortcut_row("Ctrl + 1-9", "Switch workspace"));
         content_col = content_col.push(shortcut_row("Cmd + 1-9", "Switch tab"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to attention tab"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
 
         // Tabs
         content_col = content_col.push(section_header("Tabs"));
