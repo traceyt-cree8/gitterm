@@ -1868,6 +1868,8 @@ pub enum Event {
     // Claude tab
     NewClaudeTab,
     ResumeClaudeTab,
+    // Edit file in editor
+    EditFile(PathBuf),
     // Claude sidebar events
     ToggleClaudeSection(String),
     ClaudeItemSelect(String, usize),
@@ -2704,6 +2706,19 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::EditFile(path) => {
+                // Open a file in $EDITOR (fallback: vim) in a new tab
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+                let cmd = format!("{} \"{}\"", editor, path.display());
+                if let Some(ws) = self.active_workspace() {
+                    let dir = ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    self.add_tab_with_command(dir, Some(cmd));
+                    self.save_workspaces();
+                    return self.scroll_to_active_tab();
+                }
+            }
             Event::BottomTabSelect(tab) => {
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.active_bottom_tab = tab;
@@ -2972,6 +2987,11 @@ fi
                             Key::Character(c) if c == "G" => {
                                 let last = (tab.total_changes() as i32) - 1;
                                 return Task::done(Event::FileSelectByIndex(last));
+                            }
+                            Key::Character(c) if c == "e" => {
+                                // Open selected file in $EDITOR
+                                let full_path = tab.repo_path.join(tab.selected_file.as_ref().unwrap());
+                                return Task::done(Event::EditFile(full_path));
                             }
                             _ => {}
                         }
@@ -5168,11 +5188,24 @@ fi
                 Event::ViewFile(entry.path.clone())
             };
 
-            let btn = button(entry_row)
+            let file_btn = button(entry_row)
                 .style(button::text)
                 .padding([4, 8])
                 .width(Length::Fill)
                 .on_press(event);
+
+            // For files, add an edit button; for dirs, just use the nav button
+            let btn: Element<'a, Event, Theme, iced::Renderer> = if !entry.is_dir {
+                let edit_btn = button(text("\u{270e}").size(font_small).color(theme.text_secondary()))
+                    .style(button::text)
+                    .padding([4, 6])
+                    .on_press(Event::EditFile(entry.path.clone()));
+                row![file_btn, edit_btn]
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            } else {
+                file_btn.into()
+            };
 
             if let Some(bg) = bg_color {
                 content = content.push(
@@ -6303,6 +6336,7 @@ fi
             theme.text_primary()
         };
 
+        let font_small = self.ui_font_small();
         let file_row = row![
             text(&file.status)
                 .size(font)
@@ -6318,10 +6352,25 @@ fi
             button::text
         };
 
-        button(file_row)
+        let select_btn = button(file_row)
             .style(btn_style)
             .padding([4, 8])
-            .on_press(Event::FileSelect(file.path.clone(), file.is_staged))
+            .width(Length::Fill)
+            .on_press(Event::FileSelect(file.path.clone(), file.is_staged));
+
+        // Don't show edit button for deleted files
+        if file.status == "D" {
+            return select_btn.into();
+        }
+
+        let full_path = tab.repo_path.join(&file.path);
+        let edit_btn = button(text("\u{270e}").size(font_small).color(theme.text_secondary()))
+            .style(button::text)
+            .padding([4, 6])
+            .on_press(Event::EditFile(full_path));
+
+        row![select_btn, edit_btn]
+            .align_y(iced::Alignment::Center)
             .into()
     }
 
