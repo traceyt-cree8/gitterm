@@ -1,7 +1,7 @@
 use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
-use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Column, Row, Stack};
+use iced::widget::{button, column, container, image, row, scrollable, text, text_editor, text_input, Column, Row, Stack};
 use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -690,6 +690,7 @@ struct ConsoleState {
     output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ConsoleOutputMessage>>,
     child_killer: Option<tokio::sync::oneshot::Sender<()>>,
     detected_url: Option<String>,
+    editor_content: text_editor::Content,
 }
 
 impl ConsoleState {
@@ -709,6 +710,7 @@ impl ConsoleState {
             output_rx: None,
             child_killer: None,
             detected_url: None,
+            editor_content: text_editor::Content::new(),
         }
     }
 
@@ -720,16 +722,42 @@ impl ConsoleState {
             }
         }
         let now = chrono::Local::now();
+        let timestamp = now.format("%H:%M:%S").to_string();
         self.output_lines.push(ConsoleOutputLine {
-            timestamp: now.format("%H:%M:%S").to_string(),
-            content,
+            timestamp: timestamp.clone(),
+            content: content.clone(),
             is_stderr,
         });
         // Cap output buffer
         if self.output_lines.len() > MAX_CONSOLE_LINES {
             let drain_count = self.output_lines.len() - MAX_CONSOLE_LINES;
             self.output_lines.drain(..drain_count);
+            self.rebuild_editor_content();
+        } else {
+            // Append new line to editor content
+            let line = format!("{} {}", timestamp, content);
+            if self.output_lines.len() > 1 {
+                // Move cursor to end and insert newline + text
+                self.editor_content.perform(text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd));
+                self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Enter));
+                for ch in line.chars() {
+                    self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(ch)));
+                }
+            } else {
+                // First line
+                for ch in line.chars() {
+                    self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(ch)));
+                }
+            }
         }
+    }
+
+    fn rebuild_editor_content(&mut self) {
+        let full_text: String = self.output_lines.iter()
+            .map(|l| format!("{} {}", l.timestamp, l.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.editor_content = text_editor::Content::with_text(&full_text);
     }
 
     /// Strip ANSI escape sequences from a string.
@@ -791,6 +819,7 @@ impl ConsoleState {
 
     fn clear_output(&mut self) {
         self.output_lines.clear();
+        self.editor_content = text_editor::Content::new();
     }
 
     fn uptime_string(&self) -> String {
@@ -1878,10 +1907,15 @@ pub enum Event {
     BottomTerminalAdd,
     BottomTerminalClose(usize),
     BottomTerminalEvent(usize, iced_term::Event),
+    // Console editor (selectable output)
+    ConsoleEditorAction(text_editor::Action),
     // Modifier tracking
     ModifiersChanged(Modifiers),
     // Help modal
     ToggleHelp,
+    // Terminal focus click events
+    MainTerminalClicked,
+    BottomTerminalClicked(usize),
 }
 
 struct App {
@@ -2533,6 +2567,16 @@ fi
 
     fn update(&mut self, event: Event) -> Task<Event> {
         match event {
+            Event::MainTerminalClicked => {
+                if self.bottom_panel_focused {
+                    return self.focus_main_terminal();
+                }
+            }
+            Event::BottomTerminalClicked(idx) => {
+                if !self.bottom_panel_focused {
+                    return self.focus_bottom_terminal(idx);
+                }
+            }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
                 // Main terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
@@ -3732,6 +3776,14 @@ fi
                     ws.console.spawn_process(&dir);
                 }
                 self.console_expanded = true;
+            }
+            Event::ConsoleEditorAction(action) => {
+                // Allow selection/navigation but not editing
+                if !action.is_edit() {
+                    if let Some(ws) = self.active_workspace_mut() {
+                        ws.console.editor_content.perform(action);
+                    }
+                }
             }
             Event::ConsoleClearOutput => {
                 if let Some(ws) = self.active_workspace_mut() {
@@ -6605,14 +6657,16 @@ fi
         let bg = theme.bg_base();
         let terminal_view: Element<'a, Event, Theme, iced::Renderer> = if let Some(term) = &tab.terminal {
             let tab_id = tab.id;
-            container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
+            let term_container = container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .padding(4)
                 .style(move |_| container::Style {
                     background: Some(bg.into()),
                     ..Default::default()
-                })
+                });
+            iced::widget::mouse_area(term_container)
+                .on_press(Event::MainTerminalClicked)
                 .into()
         } else {
             container(text("Terminal unavailable").size(14).color(theme.text_secondary()))
@@ -6674,14 +6728,16 @@ fi
                 if let Some(bt) = ws.bottom_terminals.get(idx) {
                     if let Some(term) = &bt.terminal {
                         let bt_id = bt.id;
-                        container(
+                        let bt_container = container(
                             TerminalView::show(term)
                                 .map(move |e| Event::BottomTerminalEvent(bt_id, e)),
                         )
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .padding([2, 0])
-                        .into()
+                        .padding([2, 0]);
+                        iced::widget::mouse_area(bt_container)
+                            .on_press(Event::BottomTerminalClicked(idx))
+                            .into()
                     } else {
                         let text_color = theme.text_secondary();
                         container(text("Terminal unavailable").size(14).color(text_color))
@@ -7097,44 +7153,27 @@ fi
             .into();
         }
 
-        let timestamp_color = theme.surface2();
-        let text_color = color!(0xa6adc8); // subtext0
-        let stderr_color = theme.danger();
-
-        let mut output_col = Column::new().spacing(0).padding([4, 8]);
-
-        for line in &console.output_lines {
-            let ts = text(&line.timestamp)
-                .size(10)
-                .color(timestamp_color)
-                .font(iced::Font::with_name("Menlo"));
-
-            let content_color = if line.is_stderr { stderr_color } else { text_color };
-            let content = text(&line.content)
-                .size(11)
-                .color(content_color)
-                .font(iced::Font::with_name("Menlo"));
-
-            output_col = output_col.push(
-                row![ts, content]
-                    .spacing(8)
-                    .align_y(iced::Alignment::Start),
-            );
-        }
-
         let bg = theme.bg_crust();
+        let text_color = theme.text_secondary();
+        let selection_color = theme.surface2();
+
         container(
-            scrollable(output_col)
-                .anchor_bottom()
-                .width(Length::Fill)
+            text_editor(&console.editor_content)
+                .on_action(Event::ConsoleEditorAction)
+                .font(iced::Font::with_name("Menlo"))
+                .size(11)
+                .padding([4, 8])
+                .style(move |_theme, _status| text_editor::Style {
+                    background: bg.into(),
+                    border: iced::Border::default(),
+                    placeholder: text_color,
+                    value: text_color,
+                    selection: selection_color,
+                })
                 .height(Length::Fill),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        })
         .into()
     }
 
