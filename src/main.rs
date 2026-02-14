@@ -1803,7 +1803,8 @@ pub enum Event {
     FileSelectByIndex(i32),
     ClearSelection,
     KeyPressed(Key, Modifiers),
-    // File explorer events
+    // Sidebar
+    ToggleSidebar,
     SetSidebarMode(SidebarMode),
     NavigateDir(PathBuf),
     NavigateUp,
@@ -1891,6 +1892,7 @@ struct App {
     ui_font_size: f32,
     sidebar_width: f32,
     scrollback_lines: usize,
+    sidebar_collapsed: bool,
     dragging_divider: bool,
     show_hidden: bool,
     window_size: (f32, f32),
@@ -2101,6 +2103,7 @@ impl App {
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
             scrollback_lines: config.scrollback_lines,
+            sidebar_collapsed: false,
             dragging_divider: false,
             show_hidden: config.show_hidden,
             window_size: (1400.0, 800.0), // Initial size, updated on resize
@@ -2893,6 +2896,10 @@ fi
                 // Console shortcuts (Cmd+J, Cmd+Shift+R) - before search shortcuts
                 if modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
+                        // Cmd+B - Toggle sidebar
+                        if c == "b" && !modifiers.shift() {
+                            return Task::done(Event::ToggleSidebar);
+                        }
                         // Cmd+J - Toggle console panel
                         if c == "j" && !modifiers.shift() {
                             return Task::done(Event::ConsoleToggle);
@@ -3030,7 +3037,19 @@ fi
                     }
                 }
             }
+            Event::ToggleSidebar => {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+                // Update WebView bounds if active
+                if webview::is_active() {
+                    let bounds = self.calculate_webview_bounds();
+                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                }
+            }
             Event::SetSidebarMode(mode) => {
+                // Expand sidebar if collapsed when switching modes
+                if self.sidebar_collapsed {
+                    self.sidebar_collapsed = false;
+                }
                 // Hide WebView when switching modes
                 webview::set_visible(false);
 
@@ -3748,7 +3767,11 @@ fi
         let tab_bar_height = 33.0; // tabs row (~24px buttons + 8px padding) + 1px separator
         let header_height = 45.0;  // file viewer header
         let workspace_bar_height = 28.0; // bottom workspace bar + 1px border
-        let x = SPINE_WIDTH + self.sidebar_width + 4.0; // rail + sidebar + divider
+        let x = if self.sidebar_collapsed {
+            SPINE_WIDTH + 36.0 + 1.0 // spine + icon rail + border
+        } else {
+            SPINE_WIDTH + self.sidebar_width + 4.0 // spine + sidebar + divider
+        };
         let y = tab_bar_height + header_height;
         let width = (self.window_size.0 - x).max(100.0);
         // Subtract console panel height + workspace bar
@@ -3901,6 +3924,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + 1-9", "Switch tab"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to attention tab"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
+        content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
 
         // Tabs
         content_col = content_col.push(section_header("Tabs"));
@@ -4616,8 +4640,6 @@ fi
     fn view_workspace_content<'a>(&'a self, ws: &'a Workspace) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
-            let sidebar = self.view_sidebar(tab);
-
             let main_panel = if tab.viewing_file_path.is_some() {
                 self.view_file_content(tab)
             } else if tab.selected_file.is_some() {
@@ -4626,29 +4648,49 @@ fi
                 self.view_terminal(tab)
             };
 
-            // Draggable divider
-            let divider_color = if self.dragging_divider {
-                theme.accent()
-            } else {
-                theme.border()
-            };
-            let divider = iced::widget::mouse_area(
-                container(iced::widget::Space::new())
-                    .width(Length::Fixed(4.0))
+            if self.sidebar_collapsed {
+                let icon_rail = self.view_sidebar_rail(tab);
+                let border_color = theme.border();
+                let rail_border = container(iced::widget::Space::new())
+                    .width(Length::Fixed(1.0))
                     .height(Length::Fill)
                     .style(move |_| container::Style {
-                        background: Some(divider_color.into()),
+                        background: Some(border_color.into()),
                         ..Default::default()
-                    }),
-            )
-            .on_press(Event::DividerDragStart)
-            .interaction(iced::mouse::Interaction::ResizingHorizontally);
+                    });
 
-            row![sidebar, divider, main_panel]
-                .spacing(0)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+                row![icon_rail, rail_border, main_panel]
+                    .spacing(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                let sidebar = self.view_sidebar(tab);
+
+                // Draggable divider
+                let divider_color = if self.dragging_divider {
+                    theme.accent()
+                } else {
+                    theme.border()
+                };
+                let divider = iced::widget::mouse_area(
+                    container(iced::widget::Space::new())
+                        .width(Length::Fixed(4.0))
+                        .height(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(divider_color.into()),
+                            ..Default::default()
+                        }),
+                )
+                .on_press(Event::DividerDragStart)
+                .interaction(iced::mouse::Interaction::ResizingHorizontally);
+
+                row![sidebar, divider, main_panel]
+                    .spacing(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
         } else {
             let bg = theme.bg_base();
             container(
@@ -4783,6 +4825,114 @@ fi
             .into()
     }
 
+    /// Collapsed sidebar: vertical icon rail with single-letter mode buttons
+    fn view_sidebar_rail<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+
+        let rail_width: f32 = 36.0;
+
+        let modes = [
+            ("\u{2387}", SidebarMode::Git),    // ⎇ branch symbol
+            ("\u{1F4C1}", SidebarMode::Files),  // 📁 folder
+            ("\u{2726}", SidebarMode::Claude),   // ✦ sparkle
+        ];
+
+        let mut rail_col = Column::new().spacing(0).width(Length::Fixed(rail_width));
+
+        for (label, mode) in &modes {
+            let is_active = tab.sidebar_mode == *mode;
+            let text_color = if is_active { theme.text_primary() } else { theme.overlay1() };
+            let accent = theme.accent();
+            let hover_bg = theme.surface0();
+
+            // Active indicator: accent bar on the left edge
+            let indicator_color = if is_active { accent } else { iced::Color::TRANSPARENT };
+            let indicator = container(iced::widget::Space::new())
+                .width(Length::Fixed(2.0))
+                .height(Length::Fixed(24.0))
+                .style(move |_| container::Style {
+                    background: Some(indicator_color.into()),
+                    border: iced::Border { radius: 1.0.into(), ..Default::default() },
+                    ..Default::default()
+                });
+
+            let letter = text(*label).size(font).color(text_color);
+
+            let btn_content = row![
+                indicator,
+                container(letter)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fixed(24.0))
+            ]
+            .spacing(0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fixed(rail_width));
+
+            let mode_clone = *mode;
+            let mode_btn = button(btn_content)
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        Some(hover_bg.into())
+                    } else {
+                        Some(iced::Color::TRANSPARENT.into())
+                    };
+                    button::Style {
+                        background: bg,
+                        border: iced::Border::default(),
+                        text_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([8, 0])
+                .width(Length::Fixed(rail_width))
+                .on_press(Event::SetSidebarMode(mode_clone));
+
+            rail_col = rail_col.push(mode_btn);
+        }
+
+        // Spacer to push expand chevron to bottom
+        rail_col = rail_col.push(iced::widget::Space::new().height(Length::Fill));
+
+        // Expand chevron at bottom
+        let chevron_color = theme.overlay0();
+        let hover_bg = theme.surface0();
+        let expand_btn = button(
+            container(text("\u{25B6}").size(10).color(chevron_color))
+                .center_x(Length::Fixed(rail_width))
+        )
+        .style(move |_theme, status| {
+            let bg = if matches!(status, button::Status::Hovered) {
+                Some(hover_bg.into())
+            } else {
+                Some(iced::Color::TRANSPARENT.into())
+            };
+            button::Style {
+                background: bg,
+                border: iced::Border::default(),
+                ..Default::default()
+            }
+        })
+        .padding([8, 0])
+        .width(Length::Fixed(rail_width))
+        .on_press(Event::ToggleSidebar);
+
+        rail_col = rail_col.push(expand_btn);
+
+        let bg = theme.bg_surface();
+        container(rail_col)
+            .width(Length::Fixed(rail_width))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn view_sidebar_tab<'a>(
         &'a self,
         label: Element<'a, Event, Theme, iced::Renderer>,
@@ -4879,7 +5029,19 @@ fi
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
 
-        let tab_row = container(row![git_tab, files_tab, claude_tab].spacing(0))
+        // Collapse chevron (same style as console toggle)
+        let chevron_color = theme.overlay0();
+        let collapse_chevron = button(
+            text("\u{25C0}").size(10).color(chevron_color) // ◀ left-pointing
+        )
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Color::TRANSPARENT.into()),
+            ..Default::default()
+        })
+        .padding([4, 4])
+        .on_press(Event::ToggleSidebar);
+
+        let tab_row = container(row![git_tab, files_tab, claude_tab, collapse_chevron].spacing(0))
             .padding([4, 4])
             .width(Length::Fill)
             .style(move |_| container::Style {
