@@ -825,6 +825,7 @@ impl ConsoleState {
                 }
             };
 
+            #[cfg(unix)]
             let child_pid = child.id();
 
             let stdout = child.stdout.take().unwrap();
@@ -2331,8 +2332,8 @@ fi
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
                                 tab.terminal_title = Some(title.clone());
-                                // Detect attention: Claude Code sets "*" prefix when waiting for input
-                                tab.needs_attention = title.starts_with('*');
+                                // Detect attention: Claude Code sets "✳" (U+2733) prefix when waiting for input
+                                tab.needs_attention = title.starts_with('✳');
 
                                 // Try to sync sidebar directory from terminal title
                                 if let Some(dir) = TabState::extract_dir_from_title(&title) {
