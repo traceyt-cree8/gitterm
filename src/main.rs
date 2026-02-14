@@ -5434,9 +5434,19 @@ fi
         let mut in_mermaid_block = false;
         let mut code_block_content: Vec<String> = Vec::new();
         let mut in_list = false;
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
+        let mut table_has_header = false;
 
         for line in &tab.file_content {
             let trimmed = line.trim();
+
+            // Table row accumulation — detect end of table and render
+            if !table_rows.is_empty() && !trimmed.starts_with('|') {
+                // End of table — render it
+                content = content.push(self.view_markdown_table(&table_rows, table_has_header));
+                table_rows.clear();
+                table_has_header = false;
+            }
 
             // Handle code blocks
             if trimmed.starts_with("```") {
@@ -5593,11 +5603,7 @@ fi
                 let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
                 let border_color = theme.border();
                 content = content.push(
-                    container(
-                        text(quote_text)
-                            .size(font)
-                            .color(theme.text_secondary()),
-                    )
+                    container(self.parse_inline_markdown(quote_text, font))
                     .padding([8, 16])
                     .style(move |_| container::Style {
                         border: iced::Border {
@@ -5628,7 +5634,7 @@ fi
                 content = content.push(
                     row![
                         text("  \u{2022}  ").size(font).color(theme.text_secondary()),
-                        text(list_text).size(font).color(theme.text_primary()),
+                        self.parse_inline_markdown(list_text, font),
                     ]
                     .spacing(0),
                 );
@@ -5657,10 +5663,27 @@ fi
                     content = content.push(
                         row![
                             text(format!("  {}.  ", num)).size(font).color(theme.text_secondary()),
-                            text(list_text).size(font).color(theme.text_primary()),
+                            self.parse_inline_markdown(list_text, font),
                         ]
                         .spacing(0),
                     );
+                }
+            }
+            // Table rows
+            else if trimmed.starts_with('|') {
+                // Separator row (|---|---|)
+                let is_separator = trimmed.contains("---");
+                if is_separator {
+                    table_has_header = true;
+                } else {
+                    let cells: Vec<String> = trimmed
+                        .split('|')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.trim().to_string())
+                        .collect();
+                    if !cells.is_empty() {
+                        table_rows.push(cells);
+                    }
                 }
             }
             // Empty line
@@ -5672,16 +5695,255 @@ fi
             }
             // Regular paragraph
             else {
-                content = content.push(
-                    text(line)
-                        .size(font)
-                        .color(theme.text_primary()),
-                );
+                content = content.push(self.parse_inline_markdown(line, font));
             }
+        }
+
+        // Flush any remaining table
+        if !table_rows.is_empty() {
+            content = content.push(self.view_markdown_table(&table_rows, table_has_header));
         }
 
         scrollable(content)
             .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_markdown_table<'a>(
+        &'a self,
+        rows: &[Vec<String>],
+        has_header: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = font - 1.0;
+        let border_color = theme.border();
+        let header_bg = theme.bg_surface();
+        let alt_bg = iced::Color { a: 0.3, ..theme.bg_surface() };
+
+        let mut table_col = Column::new().spacing(0);
+
+        for (row_idx, cells) in rows.iter().enumerate() {
+            let is_header = has_header && row_idx == 0;
+            let is_even = row_idx % 2 == 0;
+
+            let mut row_widget = Row::new().spacing(0);
+
+            for cell in cells {
+                let cell_content: Element<'a, Event, Theme, iced::Renderer> = if is_header {
+                    text(cell.clone())
+                        .size(font_small)
+                        .color(theme.text_primary())
+                        .font(iced::Font {
+                            weight: iced::font::Weight::Bold,
+                            ..Default::default()
+                        })
+                        .into()
+                } else {
+                    self.parse_inline_markdown(cell, font_small).into()
+                };
+
+                let cell_bg = if is_header {
+                    header_bg
+                } else if !is_even {
+                    alt_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+
+                let cell_container = container(cell_content)
+                    .padding([6, 12])
+                    .width(Length::FillPortion(1))
+                    .style(move |_| container::Style {
+                        background: Some(cell_bg.into()),
+                        border: iced::Border {
+                            color: border_color,
+                            width: 0.5,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    });
+
+                row_widget = row_widget.push(cell_container);
+            }
+
+            table_col = table_col.push(row_widget);
+        }
+
+        let table_border = theme.border();
+        container(table_col)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                border: iced::Border {
+                    color: table_border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn parse_inline_markdown<'a>(
+        &'a self,
+        input: &str,
+        font_size: f32,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_color = theme.text_primary();
+        let code_bg = theme.bg_overlay();
+        let accent_color = theme.accent();
+        let secondary_color = theme.text_secondary();
+        let mono = iced::Font::MONOSPACE;
+        let bold_font = iced::Font { weight: iced::font::Weight::Bold, ..Default::default() };
+
+        // Quick check: if no special chars, return plain text
+        if !input.contains('`') && !input.contains('*') && !input.contains('_') && !input.contains('[') {
+            return text(input.to_string()).size(font_size).color(text_color).into();
+        }
+
+        type Span<'s> = iced::advanced::text::Span<'s, (), iced::Font>;
+
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        let chars: Vec<char> = input.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        let mut current = String::new();
+
+        while i < len {
+            // Inline code: `code`
+            if chars[i] == '`' {
+                if !current.is_empty() {
+                    spans.push(Span::new(current.clone()).color(text_color));
+                    current.clear();
+                }
+                i += 1;
+                let mut code = String::new();
+                while i < len && chars[i] != '`' {
+                    code.push(chars[i]);
+                    i += 1;
+                }
+                if i < len { i += 1; }
+                let mut code_span = Span::new(code)
+                    .font(mono)
+                    .size(font_size - 1.0)
+                    .color(text_color)
+                    .padding([0, 4]);
+                code_span.highlight = Some(iced::advanced::text::Highlight {
+                    background: code_bg.into(),
+                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                });
+                spans.push(code_span);
+            }
+            // Bold: **text** or __text__
+            else if i + 1 < len
+                && ((chars[i] == '*' && chars[i + 1] == '*')
+                    || (chars[i] == '_' && chars[i + 1] == '_'))
+            {
+                let marker = chars[i];
+                if !current.is_empty() {
+                    spans.push(Span::new(current.clone()).color(text_color));
+                    current.clear();
+                }
+                i += 2;
+                let mut bold_text = String::new();
+                while i + 1 < len && !(chars[i] == marker && chars[i + 1] == marker) {
+                    bold_text.push(chars[i]);
+                    i += 1;
+                }
+                if i + 1 < len { i += 2; }
+                // Parse inner content for nested inline code
+                if bold_text.contains('`') {
+                    let inner_chars: Vec<char> = bold_text.chars().collect();
+                    let inner_len = inner_chars.len();
+                    let mut j = 0;
+                    let mut inner_current = String::new();
+                    while j < inner_len {
+                        if inner_chars[j] == '`' {
+                            if !inner_current.is_empty() {
+                                spans.push(Span::new(inner_current.clone()).color(text_color).font(bold_font));
+                                inner_current.clear();
+                            }
+                            j += 1;
+                            let mut code = String::new();
+                            while j < inner_len && inner_chars[j] != '`' {
+                                code.push(inner_chars[j]);
+                                j += 1;
+                            }
+                            if j < inner_len { j += 1; }
+                            let mut code_span = Span::new(code)
+                                .font(iced::Font { weight: iced::font::Weight::Bold, ..mono })
+                                .size(font_size - 1.0)
+                                .color(text_color)
+                                .padding([0, 4]);
+                            code_span.highlight = Some(iced::advanced::text::Highlight {
+                                background: code_bg.into(),
+                                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                            });
+                            spans.push(code_span);
+                        } else {
+                            inner_current.push(inner_chars[j]);
+                            j += 1;
+                        }
+                    }
+                    if !inner_current.is_empty() {
+                        spans.push(Span::new(inner_current).color(text_color).font(bold_font));
+                    }
+                } else {
+                    spans.push(Span::new(bold_text).color(text_color).font(bold_font));
+                }
+            }
+            // Italic: *text* or _text_ (single, not followed by same or space)
+            else if (chars[i] == '*' || chars[i] == '_')
+                && (i + 1 < len && chars[i + 1] != chars[i] && !chars[i + 1].is_whitespace())
+            {
+                let marker = chars[i];
+                if !current.is_empty() {
+                    spans.push(Span::new(current.clone()).color(text_color));
+                    current.clear();
+                }
+                i += 1;
+                let mut italic_text = String::new();
+                while i < len && chars[i] != marker {
+                    italic_text.push(chars[i]);
+                    i += 1;
+                }
+                if i < len { i += 1; }
+                spans.push(Span::new(italic_text).color(secondary_color));
+            }
+            // Link: [text](url)
+            else if chars[i] == '[' {
+                if !current.is_empty() {
+                    spans.push(Span::new(current.clone()).color(text_color));
+                    current.clear();
+                }
+                i += 1;
+                let mut link_text = String::new();
+                while i < len && chars[i] != ']' {
+                    link_text.push(chars[i]);
+                    i += 1;
+                }
+                if i < len { i += 1; }
+                if i < len && chars[i] == '(' {
+                    i += 1;
+                    while i < len && chars[i] != ')' { i += 1; }
+                    if i < len { i += 1; }
+                }
+                spans.push(Span::new(link_text).color(accent_color).underline(true));
+            }
+            else {
+                current.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        if !current.is_empty() {
+            spans.push(Span::new(current).color(text_color));
+        }
+
+        iced::widget::text::Rich::with_spans(spans)
+            .size(font_size)
             .width(Length::Fill)
             .into()
     }
