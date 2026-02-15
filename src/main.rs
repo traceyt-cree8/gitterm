@@ -2601,9 +2601,18 @@ fi
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = false;
                 }
-                // Don't forward keyboard input to terminal while editing console command
+                // Don't forward keyboard input to terminal while editing console command or console search
                 if self.editing_console_command.is_some() {
                     return Task::none();
+                }
+                if self.console_expanded {
+                    if let Some(ws) = self.active_workspace() {
+                        if ws.console.search_visible {
+                            if let iced_term::backend::Command::Write(_) = &cmd {
+                                return Task::none();
+                            }
+                        }
+                    }
                 }
                 // Suppress terminal writes for keys we handle as app shortcuts (Ctrl+1-9, Ctrl+`)
                 if self.current_modifiers.control() && !self.current_modifiers.command() {
