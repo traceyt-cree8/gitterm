@@ -14,7 +14,6 @@ pub struct TerminalSnapshot {
 /// Snapshot of a file being viewed
 #[derive(Clone)]
 pub struct FileSnapshot {
-    pub tab_id: usize,
     pub file_path: String,
     pub content: String,
 }
@@ -48,16 +47,16 @@ impl ServerState {
 }
 
 /// Find an available port, trying 3030-3039 first, then OS-assigned
-fn find_available_port() -> u16 {
+fn find_available_port() -> Option<u16> {
     for port in 3030..3040 {
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+            return Some(port);
         }
     }
     // Fallback: let OS assign a port
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to any port");
-    listener.local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
 /// Start the HTTP log server with graceful shutdown
@@ -83,10 +82,16 @@ pub async fn start_server(state: ServerState) {
 
     let routes = index.or(tab).or(file);
 
-    let port = find_available_port();
+    let Some(port) = find_available_port() else {
+        eprintln!("Log server disabled: unable to bind any localhost port");
+        if let Ok(mut p) = bound_port.lock() {
+            *p = None;
+        }
+        return;
+    };
 
-    let (_addr, server) = warp::serve(routes)
-        .bind_with_graceful_shutdown(([127, 0, 0, 1], port), async move {
+    let (_addr, server) =
+        warp::serve(routes).bind_with_graceful_shutdown(([127, 0, 0, 1], port), async move {
             shutdown.notified().await;
         });
 

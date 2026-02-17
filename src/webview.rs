@@ -22,9 +22,7 @@ struct WindowHandleWrapper<'a> {
 impl<'a> HasWindowHandle for WindowHandleWrapper<'a> {
     fn window_handle(&self) -> Result<WindowHandle<'_>, wry::raw_window_handle::HandleError> {
         // SAFETY: We're just re-wrapping the same handle
-        Ok(unsafe {
-            WindowHandle::borrow_raw(self.handle.as_raw())
-        })
+        Ok(unsafe { WindowHandle::borrow_raw(self.handle.as_raw()) })
     }
 }
 

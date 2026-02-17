@@ -1,7 +1,10 @@
 use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
-use iced::widget::{button, column, container, image, row, scrollable, text, text_editor, text_input, Column, Row, Stack};
+use iced::widget::{
+    button, column, container, image, row, scrollable, text, text_editor, text_input, Column, Row,
+    Stack,
+};
 use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -9,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod log_server;
@@ -79,7 +82,11 @@ fn setup_menu_bar() {
         )),
     );
     terminal_font_menu
-        .append_items(&[&increase_terminal_font, &decrease_terminal_font, &clear_terminal])
+        .append_items(&[
+            &increase_terminal_font,
+            &decrease_terminal_font,
+            &clear_terminal,
+        ])
         .unwrap();
 
     // UI font submenu
@@ -175,14 +182,33 @@ struct Config {
     console_height: f32,
     #[serde(default = "default_console_expanded")]
     console_expanded: bool,
+    #[serde(default = "default_stt_enabled")]
+    stt_enabled: bool,
+    #[serde(default)]
+    stt_model_path: Option<String>,
 }
 
-fn default_terminal_font() -> f32 { 14.0 }
-fn default_ui_font() -> f32 { 13.0 }
-fn default_sidebar_width() -> f32 { 280.0 }
-fn default_scrollback_lines() -> usize { 100_000 }
-fn default_console_height() -> f32 { DEFAULT_CONSOLE_HEIGHT }
-fn default_console_expanded() -> bool { true }
+fn default_terminal_font() -> f32 {
+    14.0
+}
+fn default_ui_font() -> f32 {
+    13.0
+}
+fn default_sidebar_width() -> f32 {
+    280.0
+}
+fn default_scrollback_lines() -> usize {
+    100_000
+}
+fn default_console_height() -> f32 {
+    DEFAULT_CONSOLE_HEIGHT
+}
+fn default_console_expanded() -> bool {
+    true
+}
+fn default_stt_enabled() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -196,6 +222,8 @@ impl Default for Config {
             show_hidden: false,
             console_height: DEFAULT_CONSOLE_HEIGHT,
             console_expanded: true,
+            stt_enabled: true,
+            stt_model_path: None,
         }
     }
 }
@@ -203,7 +231,10 @@ impl Default for Config {
 impl Config {
     fn config_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config").join("gitterm").join("config.json")
+        PathBuf::from(home)
+            .join(".config")
+            .join("gitterm")
+            .join("config.json")
     }
 
     fn load() -> Self {
@@ -526,6 +557,150 @@ impl AppTheme {
     }
 }
 
+// === Speech-to-Text helpers ===
+
+fn stt_model_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("gitterm")
+        .join("models")
+        .join("ggml-base.en.bin")
+}
+
+fn stt_start_recording(
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
+) -> Result<(cpal::Stream, u32), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "No input device available".to_string())?;
+
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("Failed to get input config: {}", e))?;
+
+    let sample_rate = config.sample_rate().0;
+
+    // Clear existing buffer
+    {
+        let mut buf = audio_buffer.lock().unwrap();
+        buf.clear();
+    }
+
+    let channels = config.channels() as usize;
+    let buf = audio_buffer.clone();
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device
+            .build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut buf = buf.lock().unwrap();
+                    // Convert to mono by averaging channels
+                    if channels == 1 {
+                        buf.extend_from_slice(data);
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            let sum: f32 = chunk.iter().sum();
+                            buf.push(sum / channels as f32);
+                        }
+                    }
+                },
+                |err| eprintln!("[STT] Audio stream error: {}", err),
+                None,
+            )
+            .map_err(|e| format!("Failed to build input stream: {}", e))?,
+        cpal::SampleFormat::I16 => {
+            device
+                .build_input_stream(
+                    &config.into(),
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        let mut buf = buf.lock().unwrap();
+                        if channels == 1 {
+                            buf.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                        } else {
+                            for chunk in data.chunks(channels) {
+                                let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
+                                buf.push(sum / channels as f32);
+                            }
+                        }
+                    },
+                    |err| eprintln!("[STT] Audio stream error: {}", err),
+                    None,
+                )
+                .map_err(|e| format!("Failed to build input stream: {}", e))?
+        }
+        format => return Err(format!("Unsupported sample format: {:?}", format)),
+    };
+
+    stream
+        .play()
+        .map_err(|e| format!("Failed to start stream: {}", e))?;
+
+    Ok((stream, sample_rate))
+}
+
+fn stt_transcribe(
+    ctx: Arc<whisper_rs::WhisperContext>,
+    mono_samples: Vec<f32>,
+    input_sample_rate: u32,
+) -> Result<String, String> {
+    let input_rate = input_sample_rate as usize;
+    let output_rate = 16000usize;
+
+
+    // Resample to 16kHz for Whisper using linear interpolation
+    let resampled = if input_rate != output_rate {
+        let ratio = input_rate as f64 / output_rate as f64;
+        let output_len = (mono_samples.len() as f64 / ratio) as usize;
+        let mut output = Vec::with_capacity(output_len);
+        for i in 0..output_len {
+            let src_idx = i as f64 * ratio;
+            let idx0 = src_idx as usize;
+            let frac = src_idx - idx0 as f64;
+            let s0 = mono_samples.get(idx0).copied().unwrap_or(0.0);
+            let s1 = mono_samples.get(idx0 + 1).copied().unwrap_or(s0);
+            output.push(s0 + (s1 - s0) * frac as f32);
+        }
+        output
+    } else {
+        mono_samples
+    };
+
+    // Run Whisper
+    let mut state = ctx
+        .create_state()
+        .map_err(|e| format!("Failed to create whisper state: {}", e))?;
+
+    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("en"));
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_suppress_blank(true);
+    params.set_no_speech_thold(0.6);
+
+    state
+        .full(params, &resampled)
+        .map_err(|e| format!("Whisper transcription failed: {}", e))?;
+
+    let num_segments = state.full_n_segments();
+    let mut result = String::new();
+    for i in 0..num_segments {
+        if let Some(segment) = state.get_segment(i) {
+            if let Ok(segment_text) = segment.to_str_lossy() {
+                result.push_str(&segment_text);
+            }
+        }
+    }
+
+    Ok(result.trim().to_string())
+}
+
 fn main() -> iced::Result {
     // Load app icon from embedded PNG
     let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
@@ -669,7 +844,6 @@ enum ConsoleStatus {
 struct ConsoleOutputLine {
     timestamp: String,
     content: String,
-    is_stderr: bool,
 }
 
 // Sent through mpsc channel from background task
@@ -720,7 +894,7 @@ impl ConsoleState {
         }
     }
 
-    fn push_line(&mut self, content: String, is_stderr: bool) {
+    fn push_line(&mut self, content: String, _is_stderr: bool) {
         // Detect URLs/ports in output (only if we haven't found one yet)
         if self.detected_url.is_none() {
             if let Some(url) = Self::detect_url(&content) {
@@ -732,7 +906,6 @@ impl ConsoleState {
         self.output_lines.push(ConsoleOutputLine {
             timestamp: timestamp.clone(),
             content,
-            is_stderr,
         });
         // Cap output buffer
         if self.output_lines.len() > MAX_CONSOLE_LINES {
@@ -754,8 +927,14 @@ impl ConsoleState {
     fn rebuild_editor_content(&mut self) {
         let query = self.search_query.to_lowercase();
         let filtering = self.search_visible && !query.is_empty();
-        let full_text: String = self.output_lines.iter()
-            .filter(|l| !filtering || l.content.to_lowercase().contains(&query) || l.timestamp.contains(&query))
+        let full_text: String = self
+            .output_lines
+            .iter()
+            .filter(|l| {
+                !filtering
+                    || l.content.to_lowercase().contains(&query)
+                    || l.timestamp.contains(&query)
+            })
             .map(|l| format!("{} {}", l.timestamp, l.content))
             .collect::<Vec<_>>()
             .join("\n");
@@ -767,7 +946,8 @@ impl ConsoleState {
         if query.is_empty() {
             return 0;
         }
-        self.output_lines.iter()
+        self.output_lines
+            .iter()
             .filter(|l| l.content.to_lowercase().contains(&query) || l.timestamp.contains(&query))
             .count()
     }
@@ -803,13 +983,15 @@ impl ConsoleState {
         // Match explicit URLs: http://localhost:3000, http://127.0.0.1:8080, etc.
         if let Some(start) = clean.find("http://") {
             let url = &clean[start..];
-            let end = url.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+            let end = url
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
                 .unwrap_or(url.len());
             return Some(url[..end].to_string());
         }
         if let Some(start) = clean.find("https://localhost") {
             let url = &clean[start..];
-            let end = url.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+            let end = url
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
                 .unwrap_or(url.len());
             return Some(url[..end].to_string());
         }
@@ -906,7 +1088,10 @@ impl ConsoleState {
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(e) => {
-                    let _ = tx.send(ConsoleOutputMessage::Stderr(format!("Failed to start: {}", e)));
+                    let _ = tx.send(ConsoleOutputMessage::Stderr(format!(
+                        "Failed to start: {}",
+                        e
+                    )));
                     let _ = tx.send(ConsoleOutputMessage::Exited(Some(1)));
                     return;
                 }
@@ -1092,6 +1277,7 @@ struct TabState {
     startup_command: Option<String>,
     // Claude config tree view
     claude_config: ClaudeConfig,
+    is_git_repo: bool,
 }
 
 impl TabState {
@@ -1101,6 +1287,7 @@ impl TabState {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         let current_dir = repo_path.clone();
+        let is_git_repo = Repository::open(&repo_path).is_ok();
 
         Self {
             id,
@@ -1129,13 +1316,19 @@ impl TabState {
             needs_attention: false,
             startup_command: None,
             claude_config: ClaudeConfig::default(),
+            is_git_repo,
         }
     }
 
     fn is_image_file(path: &PathBuf) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|ext| matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"))
+            .map(|ext| {
+                matches!(
+                    ext.to_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+                )
+            })
             .unwrap_or(false)
     }
 
@@ -1168,7 +1361,11 @@ impl TabState {
                 return None;
             };
             let path = PathBuf::from(&expanded);
-            if path.is_dir() { Some(path) } else { None }
+            if path.is_dir() {
+                Some(path)
+            } else {
+                None
+            }
         };
 
         // First: look for path at the start, ending at " (" which often indicates extra info
@@ -1186,7 +1383,8 @@ impl TabState {
         }
 
         // Third: split by em-dash or colon (but NOT hyphen, as paths often have hyphens)
-        for sep in &['\u{2014}', ':'] { // em-dash, colon
+        for sep in &['\u{2014}', ':'] {
+            // em-dash, colon
             for part in title.split(*sep) {
                 // Also try stripping at " (" within each part
                 let part = if let Some(pos) = part.find(" (") {
@@ -1203,6 +1401,7 @@ impl TabState {
         None
     }
 
+    #[allow(dead_code)]
     fn fetch_file_tree(&mut self, show_hidden: bool) {
         self.file_tree.clear();
 
@@ -1243,6 +1442,7 @@ impl TabState {
         }
     }
 
+    #[allow(dead_code)]
     fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
         self.file_content.clear();
         self.image_handle = None;
@@ -1278,6 +1478,7 @@ impl TabState {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn fetch_status(&mut self) {
         if let Ok(repo) = Repository::open(&self.repo_path) {
             // Get branch name
@@ -1360,7 +1561,11 @@ impl TabState {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     skill_names.insert(name.clone());
                     self.claude_config.skills.push(ClaudeConfigItem {
                         name,
@@ -1375,7 +1580,11 @@ impl TabState {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     if !skill_names.contains(&name) {
                         self.claude_config.skills.push(ClaudeConfigItem {
                             name,
@@ -1386,7 +1595,9 @@ impl TabState {
                 }
             }
         }
-        self.claude_config.skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.claude_config
+            .skills
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // --- Read settings.json ---
         let settings_path = claude_home.join("settings.json");
@@ -1406,7 +1617,9 @@ impl TabState {
                 }
             }
         }
-        self.claude_config.plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.claude_config
+            .plugins
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // --- MCP Servers ---
         // Project .mcp.json
@@ -1440,7 +1653,9 @@ impl TabState {
                 }
             }
         }
-        self.claude_config.mcp_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.claude_config
+            .mcp_servers
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // --- Hooks ---
         if let Some(ref settings) = settings_json {
@@ -1454,7 +1669,9 @@ impl TabState {
                 }
             }
         }
-        self.claude_config.hooks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.claude_config
+            .hooks
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // --- Settings ---
         // User settings (top-level keys, excluding plugins/hooks which have their own sections)
@@ -1488,9 +1705,12 @@ impl TabState {
                 }
             }
         }
-        self.claude_config.settings.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.claude_config
+            .settings
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     }
 
+    #[allow(dead_code)]
     fn fetch_diff(&mut self, file_path: &str, staged: bool) {
         self.diff_lines.clear();
 
@@ -1595,6 +1815,7 @@ impl TabState {
         }
     }
 
+    #[allow(dead_code)]
     fn add_word_diffs(&mut self) {
         let mut i = 0;
         while i < self.diff_lines.len() {
@@ -1630,20 +1851,28 @@ impl TabState {
                     let word_changes = compute_word_diff(&del_content, &add_content);
 
                     // Check if there's meaningful overlap
-                    let has_equal = word_changes.iter().any(|c| c.change_type == ChangeType::Equal);
+                    let has_equal = word_changes
+                        .iter()
+                        .any(|c| c.change_type == ChangeType::Equal);
 
                     if has_equal {
                         // Build inline changes for deletion line
                         let del_inline: Vec<InlineChange> = word_changes
                             .iter()
-                            .filter(|c| c.change_type == ChangeType::Equal || c.change_type == ChangeType::Delete)
+                            .filter(|c| {
+                                c.change_type == ChangeType::Equal
+                                    || c.change_type == ChangeType::Delete
+                            })
                             .cloned()
                             .collect();
 
                         // Build inline changes for addition line
                         let add_inline: Vec<InlineChange> = word_changes
                             .iter()
-                            .filter(|c| c.change_type == ChangeType::Equal || c.change_type == ChangeType::Insert)
+                            .filter(|c| {
+                                c.change_type == ChangeType::Equal
+                                    || c.change_type == ChangeType::Insert
+                            })
                             .cloned()
                             .collect();
 
@@ -1701,8 +1930,14 @@ impl WorkspaceColor {
     }
 
     const ALL: [Self; 8] = [
-        Self::Lavender, Self::Blue, Self::Green, Self::Peach,
-        Self::Pink, Self::Yellow, Self::Red, Self::Teal,
+        Self::Lavender,
+        Self::Blue,
+        Self::Green,
+        Self::Peach,
+        Self::Pink,
+        Self::Yellow,
+        Self::Red,
+        Self::Teal,
     ];
 
     fn from_index(idx: usize) -> Self {
@@ -1711,7 +1946,8 @@ impl WorkspaceColor {
 
     /// Pick the first color not already used by existing workspaces
     fn next_available(used: &[Self]) -> Self {
-        Self::ALL.iter()
+        Self::ALL
+            .iter()
             .find(|c| !used.contains(c))
             .copied()
             .unwrap_or_else(|| Self::from_index(used.len()))
@@ -1769,10 +2005,7 @@ impl Workspace {
     }
 
     fn derive_abbrev(name: &str) -> String {
-        name.chars()
-            .take(2)
-            .collect::<String>()
-            .to_uppercase()
+        name.chars().take(2).collect::<String>().to_uppercase()
     }
 
     fn active_tab(&self) -> Option<&TabState> {
@@ -1833,6 +2066,320 @@ fn status_char(status: Status, staged: bool) -> String {
     }
 }
 
+fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
+    let mut snapshot = GitStatusSnapshot {
+        tab_id,
+        repo_name: repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string()),
+        repo_path: repo_path.clone(),
+        branch_name: "main".to_string(),
+        is_git_repo: false,
+        staged: Vec::new(),
+        unstaged: Vec::new(),
+        untracked: Vec::new(),
+    };
+
+    if let Ok(repo) = Repository::open(&repo_path) {
+        snapshot.is_git_repo = true;
+        if let Ok(head) = repo.head() {
+            if let Some(name) = head.shorthand() {
+                snapshot.branch_name = name.to_string();
+            }
+        }
+
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false);
+
+        if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
+            for entry in statuses.iter() {
+                let path = entry.path().unwrap_or("").to_string();
+                let status = entry.status();
+
+                if status.contains(Status::INDEX_NEW)
+                    || status.contains(Status::INDEX_MODIFIED)
+                    || status.contains(Status::INDEX_DELETED)
+                    || status.contains(Status::INDEX_RENAMED)
+                {
+                    snapshot.staged.push(FileEntry {
+                        path: path.clone(),
+                        status: status_char(status, true),
+                        is_staged: true,
+                    });
+                }
+
+                if status.contains(Status::WT_MODIFIED)
+                    || status.contains(Status::WT_DELETED)
+                    || status.contains(Status::WT_RENAMED)
+                {
+                    snapshot.unstaged.push(FileEntry {
+                        path: path.clone(),
+                        status: status_char(status, false),
+                        is_staged: false,
+                    });
+                }
+
+                if status.contains(Status::WT_NEW) {
+                    snapshot.untracked.push(FileEntry {
+                        path,
+                        status: "?".to_string(),
+                        is_staged: false,
+                    });
+                }
+            }
+        }
+    }
+
+    snapshot
+}
+
+fn collect_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> FileTreeSnapshot {
+    let mut dirs: Vec<FileTreeEntry> = Vec::new();
+    let mut files: Vec<FileTreeEntry> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&current_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if name == "node_modules" || name == "target" {
+                continue;
+            }
+
+            let is_dir = path.is_dir();
+            let entry = FileTreeEntry { name, path, is_dir };
+            if is_dir {
+                dirs.push(entry);
+            } else {
+                files.push(entry);
+            }
+        }
+    }
+
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    dirs.extend(files);
+
+    FileTreeSnapshot {
+        tab_id,
+        current_dir,
+        entries: dirs,
+    }
+}
+
+fn add_word_diffs_to_lines(diff_lines: &mut [DiffLine]) {
+    let mut i = 0;
+    while i < diff_lines.len() {
+        if diff_lines[i].line_type == DiffLineType::Deletion {
+            let mut del_end = i + 1;
+            while del_end < diff_lines.len()
+                && diff_lines[del_end].line_type == DiffLineType::Deletion
+            {
+                del_end += 1;
+            }
+
+            let mut add_end = del_end;
+            while add_end < diff_lines.len()
+                && diff_lines[add_end].line_type == DiffLineType::Addition
+            {
+                add_end += 1;
+            }
+
+            let pairs = (del_end - i).min(add_end - del_end);
+            for j in 0..pairs {
+                let del_idx = i + j;
+                let add_idx = del_end + j;
+
+                let del_content = diff_lines[del_idx].content.clone();
+                let add_content = diff_lines[add_idx].content.clone();
+                let word_changes = compute_word_diff(&del_content, &add_content);
+                let has_equal = word_changes
+                    .iter()
+                    .any(|c| c.change_type == ChangeType::Equal);
+
+                if has_equal {
+                    diff_lines[del_idx].inline_changes = Some(
+                        word_changes
+                            .iter()
+                            .filter(|c| {
+                                c.change_type == ChangeType::Equal
+                                    || c.change_type == ChangeType::Delete
+                            })
+                            .cloned()
+                            .collect(),
+                    );
+                    diff_lines[add_idx].inline_changes = Some(
+                        word_changes
+                            .iter()
+                            .filter(|c| {
+                                c.change_type == ChangeType::Equal
+                                    || c.change_type == ChangeType::Insert
+                            })
+                            .cloned()
+                            .collect(),
+                    );
+                }
+            }
+
+            i = add_end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn collect_diff(
+    tab_id: usize,
+    repo_path: PathBuf,
+    file_path: String,
+    is_staged: bool,
+) -> DiffSnapshot {
+    let mut lines = Vec::new();
+    let Ok(repo) = Repository::open(&repo_path) else {
+        return DiffSnapshot {
+            tab_id,
+            file_path,
+            is_staged,
+            lines,
+        };
+    };
+
+    let is_untracked = repo
+        .statuses(None)
+        .ok()
+        .map(|statuses| {
+            statuses.iter().any(|e| {
+                e.path() == Some(file_path.as_str()) && e.status().contains(Status::WT_NEW)
+            })
+        })
+        .unwrap_or(false);
+
+    if is_untracked {
+        let full_path = repo_path.join(&file_path);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            lines.push(DiffLine {
+                content: format!("@@ -0,0 +1,{} @@ (new file)", content.lines().count()),
+                line_type: DiffLineType::Header,
+                old_line_num: None,
+                new_line_num: None,
+                inline_changes: None,
+            });
+            for (i, line) in content.lines().enumerate() {
+                lines.push(DiffLine {
+                    content: line.to_string(),
+                    line_type: DiffLineType::Addition,
+                    old_line_num: None,
+                    new_line_num: Some((i + 1) as u32),
+                    inline_changes: None,
+                });
+            }
+        }
+        return DiffSnapshot {
+            tab_id,
+            file_path,
+            is_staged,
+            lines,
+        };
+    }
+
+    let mut diff_opts = DiffOptions::new();
+    diff_opts.pathspec(&file_path);
+    let diff = if is_staged {
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+    } else {
+        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
+    };
+
+    if let Ok(diff) = diff {
+        let _ = diff.print(git2::DiffFormat::Patch, |_delta, hunk, line| {
+            let content = String::from_utf8_lossy(line.content())
+                .trim_end()
+                .to_string();
+            match line.origin() {
+                'H' => {
+                    if let Some(h) = hunk {
+                        lines.push(DiffLine {
+                            content: format!(
+                                "@@ -{},{} +{},{} @@",
+                                h.old_start(),
+                                h.old_lines(),
+                                h.new_start(),
+                                h.new_lines()
+                            ),
+                            line_type: DiffLineType::Header,
+                            old_line_num: None,
+                            new_line_num: None,
+                            inline_changes: None,
+                        });
+                    }
+                }
+                '+' => lines.push(DiffLine {
+                    content,
+                    line_type: DiffLineType::Addition,
+                    old_line_num: None,
+                    new_line_num: line.new_lineno(),
+                    inline_changes: None,
+                }),
+                '-' => lines.push(DiffLine {
+                    content,
+                    line_type: DiffLineType::Deletion,
+                    old_line_num: line.old_lineno(),
+                    new_line_num: None,
+                    inline_changes: None,
+                }),
+                ' ' => lines.push(DiffLine {
+                    content,
+                    line_type: DiffLineType::Context,
+                    old_line_num: line.old_lineno(),
+                    new_line_num: line.new_lineno(),
+                    inline_changes: None,
+                }),
+                _ => {}
+            }
+            true
+        });
+        add_word_diffs_to_lines(&mut lines);
+    }
+
+    DiffSnapshot {
+        tab_id,
+        file_path,
+        is_staged,
+        lines,
+    }
+}
+
+fn collect_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> FileLoadSnapshot {
+    let mut snapshot = FileLoadSnapshot {
+        tab_id,
+        path: path.clone(),
+        file_content: Vec::new(),
+        image_path: None,
+        webview_content: None,
+    };
+
+    if TabState::is_markdown_file(&path) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            snapshot.webview_content =
+                Some(markdown::render_markdown_to_html(&content, is_dark_theme));
+            snapshot.file_content = content.lines().map(|s| s.to_string()).collect();
+        }
+    } else if TabState::is_image_file(&path) {
+        snapshot.image_path = Some(path);
+    } else if let Ok(content) = std::fs::read_to_string(&path) {
+        snapshot.file_content = content.lines().map(|s| s.to_string()).collect();
+    }
+
+    snapshot
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Terminal(usize, iced_term::Event),
@@ -1891,7 +2438,7 @@ pub enum Event {
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
-    EdgePeekEnter(bool),  // true=right, false=left
+    EdgePeekEnter(bool), // true=right, false=left
     EdgePeekExit,
     SlideScrolled(scrollable::Viewport),
     // Console panel events
@@ -1935,6 +2482,15 @@ pub enum Event {
     // Terminal focus click events
     MainTerminalClicked,
     BottomTerminalClicked(usize),
+    GitStatusLoaded(GitStatusSnapshot),
+    FileTreeLoaded(FileTreeSnapshot),
+    DiffLoaded(DiffSnapshot),
+    FileLoaded(FileLoadSnapshot),
+    LogServerSyncComplete,
+    // Speech-to-text events
+    SttToggle,
+    SttTranscriptReady(String),
+    SttError(String),
 }
 
 struct App {
@@ -1975,6 +2531,20 @@ struct App {
     show_help: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
+    workspaces_dirty: bool,
+    next_workspace_save_at: Option<Instant>,
+    log_server_dirty: bool,
+    next_log_server_sync_at: Instant,
+    log_server_sync_in_flight: bool,
+    log_server_sync_queued: bool,
+    // Speech-to-text state
+    stt_enabled: bool,
+    stt_recording: bool,
+    stt_context: Option<Arc<whisper_rs::WhisperContext>>,
+    stt_audio_buffer: Arc<Mutex<Vec<f32>>>,
+    stt_stream: Option<cpal::Stream>,
+    stt_sample_rate: u32,
+    stt_transcribing: bool,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -2001,6 +2571,44 @@ const ESTIMATED_WS_BTN_WIDTH: f32 = 180.0;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+const WORKSPACES_SAVE_DEBOUNCE_MS: u64 = 1500;
+const LOG_SERVER_SYNC_INTERVAL_MS: u64 = 15000;
+
+#[derive(Debug, Clone)]
+pub struct GitStatusSnapshot {
+    tab_id: usize,
+    repo_path: PathBuf,
+    repo_name: String,
+    branch_name: String,
+    is_git_repo: bool,
+    staged: Vec<FileEntry>,
+    unstaged: Vec<FileEntry>,
+    untracked: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileTreeSnapshot {
+    tab_id: usize,
+    current_dir: PathBuf,
+    entries: Vec<FileTreeEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffSnapshot {
+    tab_id: usize,
+    file_path: String,
+    is_staged: bool,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileLoadSnapshot {
+    tab_id: usize,
+    path: PathBuf,
+    file_content: Vec<String>,
+    image_path: Option<PathBuf>,
+    webview_content: Option<String>,
+}
 
 impl App {
     /// UI font size
@@ -2040,26 +2648,26 @@ impl App {
     }
 
     fn scroll_to_active_tab(&self) -> Task<Event> {
-        let active_tab = self.active_workspace()
-            .map(|ws| ws.active_tab)
-            .unwrap_or(0);
+        let active_tab = self.active_workspace().map(|ws| ws.active_tab).unwrap_or(0);
         let target_x = (active_tab as f32 * ESTIMATED_TAB_WIDTH).max(0.0);
-        iced::advanced::widget::operate(
-            iced::advanced::widget::operation::scrollable::scroll_to(
-                tab_scrollable_id().into(),
-                scrollable::AbsoluteOffset { x: Some(target_x), y: None },
-            ),
-        )
+        iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
+            tab_scrollable_id().into(),
+            scrollable::AbsoluteOffset {
+                x: Some(target_x),
+                y: None,
+            },
+        ))
     }
 
     fn scroll_to_active_workspace_bar(&self) -> Task<Event> {
         let target_x = (self.active_workspace_idx as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
-        iced::advanced::widget::operate(
-            iced::advanced::widget::operation::scrollable::scroll_to(
-                workspace_bar_scrollable_id().into(),
-                scrollable::AbsoluteOffset { x: Some(target_x), y: None },
-            ),
-        )
+        iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
+            workspace_bar_scrollable_id().into(),
+            scrollable::AbsoluteOffset {
+                x: Some(target_x),
+                y: None,
+            },
+        ))
     }
 
     fn save_config(&self) {
@@ -2076,39 +2684,66 @@ impl App {
             show_hidden: self.show_hidden,
             console_height: self.console_height,
             console_expanded: self.console_expanded,
+            stt_enabled: self.stt_enabled,
+            stt_model_path: None,
         };
         config.save();
     }
 
     fn save_workspaces(&self) {
         let ws_file = WorkspacesFile {
-            workspaces: self.workspaces.iter().map(|ws| {
-                WorkspaceConfig {
+            workspaces: self
+                .workspaces
+                .iter()
+                .map(|ws| WorkspaceConfig {
                     name: ws.name.clone(),
                     abbrev: ws.abbrev.clone(),
                     dir: ws.dir.to_string_lossy().to_string(),
                     color: ws.color,
-                    tabs: ws.tabs.iter().map(|tab| {
-                        WorkspaceTabConfig {
+                    tabs: ws
+                        .tabs
+                        .iter()
+                        .map(|tab| WorkspaceTabConfig {
                             dir: tab.current_dir.to_string_lossy().to_string(),
                             startup_command: tab.startup_command.clone(),
-                        }
-                    }).collect(),
+                        })
+                        .collect(),
                     run_command: ws.console.run_command.clone(),
-                    bottom_terminals: ws.bottom_terminals.iter().map(|bt| {
-                        BottomTerminalConfig {
+                    bottom_terminals: ws
+                        .bottom_terminals
+                        .iter()
+                        .map(|bt| BottomTerminalConfig {
                             dir: bt.cwd.to_string_lossy().to_string(),
-                        }
-                    }).collect(),
-                }
-            }).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
             active_workspace: self.active_workspace_idx,
         };
         ws_file.save();
     }
 
-    /// Update the log server with current terminal content
-    fn update_log_server(&self) {
+    fn mark_workspaces_dirty(&mut self) {
+        self.workspaces_dirty = true;
+        self.next_workspace_save_at =
+            Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
+    }
+
+    fn mark_log_server_dirty(&mut self) {
+        self.log_server_dirty = true;
+    }
+
+    fn queue_log_server_sync(&mut self) -> Task<Event> {
+        if self.log_server_sync_in_flight {
+            self.log_server_sync_queued = true;
+            return Task::none();
+        }
+
+        self.log_server_dirty = false;
+        self.log_server_sync_in_flight = true;
+        self.next_log_server_sync_at =
+            Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
+
         let state = self.log_server_state.clone();
         let mut terminal_snapshots = std::collections::HashMap::new();
         let mut file_snapshots = std::collections::HashMap::new();
@@ -2130,7 +2765,6 @@ impl App {
                 if !tab.file_content.is_empty() {
                     let content = tab.file_content.join("\n");
                     let snapshot = log_server::FileSnapshot {
-                        tab_id: tab.id,
                         file_path: file_path.to_string_lossy().to_string(),
                         content,
                     };
@@ -2139,13 +2773,48 @@ impl App {
             }
         }
 
-        // Update the shared state (spawn a task to avoid blocking)
-        tokio::spawn(async move {
-            let mut terminals = state.terminals.write().await;
-            *terminals = terminal_snapshots;
-            let mut files = state.files.write().await;
-            *files = file_snapshots;
-        });
+        Task::perform(
+            async move {
+                let mut terminals = state.terminals.write().await;
+                *terminals = terminal_snapshots;
+                let mut files = state.files.write().await;
+                *files = file_snapshots;
+            },
+            |_| Event::LogServerSyncComplete,
+        )
+    }
+
+    fn request_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        Task::perform(
+            async move { collect_git_status(tab_id, repo_path) },
+            Event::GitStatusLoaded,
+        )
+    }
+
+    fn request_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> Task<Event> {
+        Task::perform(
+            async move { collect_file_tree(tab_id, current_dir, show_hidden) },
+            Event::FileTreeLoaded,
+        )
+    }
+
+    fn request_diff(
+        tab_id: usize,
+        repo_path: PathBuf,
+        file_path: String,
+        staged: bool,
+    ) -> Task<Event> {
+        Task::perform(
+            async move { collect_diff(tab_id, repo_path, file_path, staged) },
+            Event::DiffLoaded,
+        )
+    }
+
+    fn request_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> Task<Event> {
+        Task::perform(
+            async move { collect_file_load(tab_id, path, is_dark_theme) },
+            Event::FileLoaded,
+        )
     }
 }
 
@@ -2207,6 +2876,20 @@ impl App {
             current_modifiers: Modifiers::empty(),
             show_help: false,
             bottom_panel_focused: false,
+            workspaces_dirty: false,
+            next_workspace_save_at: None,
+            log_server_dirty: true,
+            next_log_server_sync_at: Instant::now(),
+            log_server_sync_in_flight: false,
+            log_server_sync_queued: false,
+            // Speech-to-text
+            stt_enabled: config.stt_enabled,
+            stt_recording: false,
+            stt_context: None,
+            stt_audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            stt_stream: None,
+            stt_sample_rate: 48000,
+            stt_transcribing: false,
         };
 
         // Try to restore workspaces from saved config
@@ -2216,7 +2899,9 @@ impl App {
                 let home = std::env::var("HOME").unwrap_or_default();
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
                 let name = if dir == PathBuf::from(&home) {
-                    ws_config.tabs.first()
+                    ws_config
+                        .tabs
+                        .first()
                         .map(|t| PathBuf::from(&t.dir))
                         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                         .unwrap_or_else(|| ws_config.name.clone())
@@ -2237,7 +2922,11 @@ impl App {
                 } else {
                     for tab_config in &ws_config.tabs {
                         let tab_dir = PathBuf::from(&tab_config.dir);
-                        app.add_tab_to_workspace_with_command(&mut workspace, tab_dir, tab_config.startup_command.clone());
+                        app.add_tab_to_workspace_with_command(
+                            &mut workspace,
+                            tab_dir,
+                            tab_config.startup_command.clone(),
+                        );
                     }
                 }
 
@@ -2249,7 +2938,9 @@ impl App {
 
                 app.workspaces.push(workspace);
             }
-            app.active_workspace_idx = ws_file.active_workspace.min(app.workspaces.len().saturating_sub(1));
+            app.active_workspace_idx = ws_file
+                .active_workspace
+                .min(app.workspaces.len().saturating_sub(1));
         }
 
         // If no workspaces were loaded, create one from the current directory
@@ -2280,7 +2971,12 @@ impl App {
         workspace.active_tab = workspace.tabs.len() - 1;
     }
 
-    fn add_tab_to_workspace_with_command(&mut self, workspace: &mut Workspace, repo_path: PathBuf, startup_command: Option<String>) {
+    fn add_tab_to_workspace_with_command(
+        &mut self,
+        workspace: &mut Workspace,
+        repo_path: PathBuf,
+        startup_command: Option<String>,
+    ) {
         let tab = self.create_tab(repo_path, startup_command);
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
@@ -2315,17 +3011,20 @@ impl App {
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
 
         #[cfg(not(target_os = "windows"))]
-        let shell = std::env::var("SHELL").ok().or_else(|| {
-            let user = std::env::var("USER").ok()?;
-            let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-            for line in passwd.lines() {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.first() == Some(&user.as_str()) {
-                    return parts.get(6).map(|s| s.to_string());
+        let shell = std::env::var("SHELL")
+            .ok()
+            .or_else(|| {
+                let user = std::env::var("USER").ok()?;
+                let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+                for line in passwd.lines() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.first() == Some(&user.as_str()) {
+                        return parts.get(6).map(|s| s.to_string());
+                    }
                 }
-            }
-            None
-        }).unwrap_or_else(|| "/bin/zsh".to_string());
+                None
+            })
+            .unwrap_or_else(|| "/bin/zsh".to_string());
 
         let mut env = std::collections::HashMap::new();
 
@@ -2333,7 +3032,10 @@ impl App {
         {
             env.insert("TERM".to_string(), "xterm-256color".to_string());
             env.insert("COLORTERM".to_string(), "truecolor".to_string());
-            env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
+            env.insert(
+                "LANG".to_string(),
+                std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()),
+            );
             if let Ok(home) = std::env::var("HOME") {
                 env.insert("HOME".to_string(), home.clone());
                 env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
@@ -2412,9 +3114,7 @@ fi
                 env,
                 ..Default::default()
             },
-            theme: iced_term::settings::ThemeSettings::new(Box::new(
-                theme.terminal_palette(),
-            )),
+            theme: iced_term::settings::ThemeSettings::new(Box::new(theme.terminal_palette())),
             font: iced_term::settings::FontSettings {
                 size: terminal_font_size,
                 ..Default::default()
@@ -2423,14 +3123,28 @@ fi
     }
 
     /// Standard noop bindings for keys we handle as app shortcuts.
-    fn standard_noop_bindings() -> Vec<(iced_term::bindings::KeyboardBinding, iced_term::bindings::BindingAction)> {
+    fn standard_noop_bindings() -> Vec<(
+        iced_term::bindings::KeyboardBinding,
+        iced_term::bindings::BindingAction,
+    )> {
         use iced_term::bindings::{BindingAction, InputKind, KeyboardBinding as Binding};
-        let mut bindings = vec![
-            (Binding { target: InputKind::Char("`".to_string()), modifiers: Modifiers::CTRL, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
-        ];
+        let mut bindings = vec![(
+            Binding {
+                target: InputKind::Char("`".to_string()),
+                modifiers: Modifiers::CTRL,
+                terminal_mode_include: iced_term::TermMode::empty(),
+                terminal_mode_exclude: iced_term::TermMode::empty(),
+            },
+            BindingAction::Noop,
+        )];
         for n in 1..=9u8 {
             bindings.push((
-                Binding { target: InputKind::Char(n.to_string()), modifiers: Modifiers::CTRL, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() },
+                Binding {
+                    target: InputKind::Char(n.to_string()),
+                    modifiers: Modifiers::CTRL,
+                    terminal_mode_include: iced_term::TermMode::empty(),
+                    terminal_mode_exclude: iced_term::TermMode::empty(),
+                },
                 BindingAction::Noop,
             ));
         }
@@ -2453,11 +3167,12 @@ fi
         );
 
         if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, settings) {
-            terminal.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
+            terminal.handle(iced_term::Command::AddBindings(
+                Self::standard_noop_bindings(),
+            ));
             tab.terminal = Some(terminal);
         }
 
-        tab.fetch_status();
         tab
     }
 
@@ -2471,11 +3186,20 @@ fi
             &self.theme,
             self.terminal_font_size,
         );
-        let terminal = iced_term::Terminal::new(id as u64, settings).ok().map(|mut t| {
-            t.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
-            t
-        });
-        BottomTerminal { id, terminal, title: None, cwd }
+        let terminal = iced_term::Terminal::new(id as u64, settings)
+            .ok()
+            .map(|mut t| {
+                t.handle(iced_term::Command::AddBindings(
+                    Self::standard_noop_bindings(),
+                ));
+                t
+            });
+        BottomTerminal {
+            id,
+            terminal,
+            title: None,
+            cwd,
+        }
     }
 
     /// Width of the content area (window width minus spine)
@@ -2496,7 +3220,8 @@ fi
     }
 
     fn active_tab_mut(&mut self) -> Option<&mut TabState> {
-        self.active_workspace_mut().and_then(|ws| ws.active_tab_mut())
+        self.active_workspace_mut()
+            .and_then(|ws| ws.active_tab_mut())
     }
 
     fn any_tab_needs_attention(&self) -> bool {
@@ -2524,9 +3249,9 @@ fi
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                     Some(Event::ModifiersChanged(modifiers))
                 }
-                iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key, modifiers, ..
-                }) => Some(Event::KeyPressed(key, modifiers)),
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Some(Event::KeyPressed(key, modifiers))
+                }
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Event::MouseMoved(position.x, position.y))
                 }
@@ -2546,16 +3271,14 @@ fi
         // Animation tick (~60fps) — when animating or waiting for swipe debounce
         if self.slide_animating || self.last_user_scroll.is_some() {
             subs.push(
-                iced::time::every(Duration::from_millis(16))
-                    .map(|_| Event::SlideAnimationTick),
+                iced::time::every(Duration::from_millis(16)).map(|_| Event::SlideAnimationTick),
             );
         }
 
-        // Attention pulse (500ms toggle) — only when any tab needs attention
-        if self.any_tab_needs_attention() {
+        // Attention pulse (500ms toggle) — when any tab needs attention or STT recording
+        if self.any_tab_needs_attention() || self.stt_recording {
             subs.push(
-                iced::time::every(Duration::from_millis(500))
-                    .map(|_| Event::AttentionPulseTick),
+                iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
             );
         }
 
@@ -2633,9 +3356,17 @@ fi
                         }
                     }
                 }
-                if let Some(tab) = self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()).find(|t| t.id == tab_id) {
+                let mut pending_task: Option<Task<Event>> = None;
+                let mut workspace_dirty = false;
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                {
                     // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
-                    if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention {
+                    if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention
+                    {
                         tab.needs_attention = false;
                     }
                     if let Some(term) = &mut tab.terminal {
@@ -2651,8 +3382,12 @@ fi
                                 if let Some(dir) = TabState::extract_dir_from_title(&title) {
                                     if dir != tab.current_dir {
                                         tab.current_dir = dir.clone();
-                                        // Always refresh file tree so it's ready when switching to Files mode
-                                        tab.fetch_file_tree(self.show_hidden);
+                                        workspace_dirty = true;
+                                        pending_task = Some(Self::request_file_tree(
+                                            tab.id,
+                                            dir.clone(),
+                                            self.show_hidden,
+                                        ));
 
                                         // Check if we're in a different git repo and update git status
                                         if let Ok(repo) = Repository::discover(&dir) {
@@ -2661,11 +3396,24 @@ fi
                                                 if new_repo_path != tab.repo_path {
                                                     // Different repo - update repo_path and refresh
                                                     tab.repo_path = new_repo_path;
-                                                    tab.repo_name = tab.repo_path
+                                                    tab.repo_name = tab
+                                                        .repo_path
                                                         .file_name()
                                                         .map(|n| n.to_string_lossy().to_string())
                                                         .unwrap_or_else(|| "repo".to_string());
-                                                    tab.fetch_status();
+                                                    tab.last_poll = Instant::now();
+                                                    let status_task = Self::request_git_status(
+                                                        tab.id,
+                                                        tab.repo_path.clone(),
+                                                    );
+                                                    pending_task = Some(
+                                                        if let Some(tree_task) = pending_task.take()
+                                                        {
+                                                            Task::batch([tree_task, status_task])
+                                                        } else {
+                                                            status_task
+                                                        },
+                                                    );
                                                 }
                                             }
                                         }
@@ -2676,20 +3424,49 @@ fi
                         }
                     }
                 }
+                if workspace_dirty {
+                    self.mark_workspaces_dirty();
+                }
+                self.mark_log_server_dirty();
+                if let Some(task) = pending_task {
+                    return task;
+                }
             }
             Event::Tick => {
-                // Poll git status every 5 seconds for the active tab
+                let mut tasks: Vec<Task<Event>> = Vec::new();
+
+                // Poll git status every 5 seconds for the active tab (off UI thread)
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.last_poll.elapsed() >= Duration::from_millis(5000) {
-                        tab.fetch_status();
+                        let tab_id = tab.id;
+                        let repo_path = tab.repo_path.clone();
+                        tab.last_poll = Instant::now();
+                        tasks.push(Self::request_git_status(tab_id, repo_path));
                     }
                 }
 
-                // Update log server with terminal content
-                self.update_log_server();
+                // Debounced workspace persistence
+                let now = Instant::now();
+                // Terminals can change independently; keep server snapshots fresh on interval.
+                self.log_server_dirty = true;
+                if self.workspaces_dirty
+                    && self
+                        .next_workspace_save_at
+                        .is_some_and(|deadline| now >= deadline)
+                {
+                    self.mark_workspaces_dirty();
+                    self.workspaces_dirty = false;
+                    self.next_workspace_save_at = None;
+                }
 
-                // Periodically save workspace state
-                self.save_workspaces();
+                // Throttled/queued log server sync
+                if self.log_server_dirty && now >= self.next_log_server_sync_at {
+                    tasks.push(self.queue_log_server_sync());
+                }
+
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
             }
             Event::InitMenu => {
                 // Initialize native macOS menu bar (must happen after NSApp exists)
@@ -2729,7 +3506,9 @@ fi
                                 Err(_) => break,
                             }
                             count += 1;
-                            if count >= 50 { break; }
+                            if count >= 50 {
+                                break;
+                            }
                         }
                         for msg in messages {
                             match msg {
@@ -2788,28 +3567,45 @@ fi
                         }
                     }
                 }
-                self.save_workspaces();
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
                 return self.scroll_to_active_tab();
             }
             Event::NewClaudeTab => {
                 // Create a new tab that auto-launches Claude Code
                 if let Some(ws) = self.active_workspace() {
-                    let dir = ws.active_tab()
+                    let dir = ws
+                        .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     self.add_tab_with_command(dir, Some("claude".to_string()));
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                    if let Some(tab) = self.active_tab() {
+                        return Task::batch([
+                            self.scroll_to_active_tab(),
+                            Self::request_git_status(tab.id, tab.repo_path.clone()),
+                        ]);
+                    }
                     return self.scroll_to_active_tab();
                 }
             }
             Event::ResumeClaudeTab => {
                 // Create a new tab that resumes the last Claude Code session
                 if let Some(ws) = self.active_workspace() {
-                    let dir = ws.active_tab()
+                    let dir = ws
+                        .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     self.add_tab_with_command(dir, Some("claude --resume".to_string()));
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                    if let Some(tab) = self.active_tab() {
+                        return Task::batch([
+                            self.scroll_to_active_tab(),
+                            Self::request_git_status(tab.id, tab.repo_path.clone()),
+                        ]);
+                    }
                     return self.scroll_to_active_tab();
                 }
             }
@@ -2818,11 +3614,19 @@ fi
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
                 let cmd = format!("{} \"{}\"", editor, path.display());
                 if let Some(ws) = self.active_workspace() {
-                    let dir = ws.active_tab()
+                    let dir = ws
+                        .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     self.add_tab_with_command(dir, Some(cmd));
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                    if let Some(tab) = self.active_tab() {
+                        return Task::batch([
+                            self.scroll_to_active_tab(),
+                            Self::request_git_status(tab.id, tab.repo_path.clone()),
+                        ]);
+                    }
                     return self.scroll_to_active_tab();
                 }
             }
@@ -2837,10 +3641,13 @@ fi
                 };
             }
             Event::BottomTerminalAdd => {
-                let dir = self.active_workspace()
-                    .map(|ws| ws.active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone()))
+                let dir = self
+                    .active_workspace()
+                    .map(|ws| {
+                        ws.active_tab()
+                            .map(|t| t.current_dir.clone())
+                            .unwrap_or_else(|| ws.dir.clone())
+                    })
                     .unwrap_or_else(|| PathBuf::from("."));
                 let bt = self.create_bottom_terminal(dir);
                 let bt_idx = if let Some(ws) = self.active_workspace_mut() {
@@ -2853,7 +3660,7 @@ fi
                 };
                 if let Some(idx) = bt_idx {
                     self.console_expanded = true;
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
                     self.save_config();
                     return self.focus_bottom_terminal(idx);
                 }
@@ -2877,7 +3684,7 @@ fi
                         }
                     }
                 }
-                self.save_workspaces();
+                self.mark_workspaces_dirty();
                 // If we closed the active bottom terminal, refocus main terminal
                 if was_active_terminal && self.bottom_panel_focused {
                     return self.focus_main_terminal();
@@ -2907,7 +3714,9 @@ fi
                         }
                     }
                 }
-                if let Some(bt) = self.workspaces.iter_mut()
+                if let Some(bt) = self
+                    .workspaces
+                    .iter_mut()
                     .flat_map(|ws| ws.bottom_terminals.iter_mut())
                     .find(|bt| bt.id == id)
                 {
@@ -2937,7 +3746,14 @@ fi
             Event::FolderSelected(Some(path)) => {
                 // Allow any folder, not just git repos
                 self.add_tab(path);
-                self.save_workspaces();
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+                if let Some(tab) = self.active_tab() {
+                    return Task::batch([
+                        self.scroll_to_active_tab(),
+                        Self::request_git_status(tab.id, tab.repo_path.clone()),
+                    ]);
+                }
                 return self.scroll_to_active_tab();
             }
             Event::FolderSelected(None) => {}
@@ -2958,7 +3774,10 @@ fi
                     }
                     tab.selected_file = Some(path.clone());
                     tab.selected_is_staged = is_staged;
-                    tab.fetch_diff(&path, is_staged);
+                    let tab_id = tab.id;
+                    let repo_path = tab.repo_path.clone();
+                    self.mark_log_server_dirty();
+                    return Self::request_diff(tab_id, repo_path, path, is_staged);
                 }
             }
             Event::FileSelectByIndex(idx) => {
@@ -2986,7 +3805,10 @@ fi
                         let is_staged = file.is_staged;
                         tab.selected_file = Some(path.clone());
                         tab.selected_is_staged = is_staged;
-                        tab.fetch_diff(&path, is_staged);
+                        let tab_id = tab.id;
+                        let repo_path = tab.repo_path.clone();
+                        self.mark_log_server_dirty();
+                        return Self::request_diff(tab_id, repo_path, path, is_staged);
                     }
                 }
             }
@@ -3134,11 +3956,19 @@ fi
                             }
                             Key::Character(c) if c == "e" => {
                                 // Open selected file in $EDITOR
-                                let full_path = tab.repo_path.join(tab.selected_file.as_ref().unwrap());
+                                let full_path =
+                                    tab.repo_path.join(tab.selected_file.as_ref().unwrap());
                                 return Task::done(Event::EditFile(full_path));
                             }
                             _ => {}
                         }
+                    }
+                }
+
+                // Ctrl+Space — toggle speech-to-text recording
+                if modifiers.control() && !modifiers.command() && !modifiers.shift() && !modifiers.alt() {
+                    if let Key::Named(key::Named::Space) = key.as_ref() {
+                        return Task::done(Event::SttToggle);
                     }
                 }
 
@@ -3192,7 +4022,8 @@ fi
                                 return Task::done(Event::DecreaseTerminalFont);
                             }
                         } else if let Ok(num) = c.parse::<usize>() {
-                            let tab_count = self.active_workspace().map(|ws| ws.tabs.len()).unwrap_or(0);
+                            let tab_count =
+                                self.active_workspace().map(|ws| ws.tabs.len()).unwrap_or(0);
                             if num >= 1 && num <= 9 && num <= tab_count {
                                 return Task::done(Event::TabSelect(num - 1));
                             }
@@ -3216,7 +4047,6 @@ fi
                 // Hide WebView when switching modes
                 webview::set_visible(false);
 
-                let show_hidden = self.show_hidden;
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.sidebar_mode != mode {
                         match mode {
@@ -3226,13 +4056,25 @@ fi
                                 tab.file_content.clear();
                                 tab.image_handle = None;
                                 tab.webview_content = None;
-                                tab.fetch_status();
+                                tab.last_poll = Instant::now();
+                                let tab_id = tab.id;
+                                let repo_path = tab.repo_path.clone();
+                                tab.sidebar_mode = mode;
+                                self.mark_log_server_dirty();
+                                return Self::request_git_status(tab_id, repo_path);
                             }
                             SidebarMode::Files => {
                                 // Switching to Files mode - clear git selection
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
-                                tab.fetch_file_tree(show_hidden);
+                                let tab_id = tab.id;
+                                let current_dir = tab.current_dir.clone();
+                                tab.sidebar_mode = mode;
+                                return Self::request_file_tree(
+                                    tab_id,
+                                    current_dir,
+                                    self.show_hidden,
+                                );
                             }
                             SidebarMode::Claude => {
                                 // Switching to Claude mode - clear file viewer and git selection
@@ -3262,11 +4104,31 @@ fi
                 if let Some(tab) = self.active_tab_mut() {
                     tab.claude_config.selected_item = Some((section.clone(), idx));
                     let file_path = match section.as_str() {
-                        "skills" => tab.claude_config.skills.get(idx).map(|i| i.file_path.clone()),
-                        "plugins" => tab.claude_config.plugins.get(idx).map(|i| i.file_path.clone()),
-                        "mcp_servers" => tab.claude_config.mcp_servers.get(idx).map(|i| i.file_path.clone()),
-                        "hooks" => tab.claude_config.hooks.get(idx).map(|i| i.file_path.clone()),
-                        "settings" => tab.claude_config.settings.get(idx).map(|i| i.file_path.clone()),
+                        "skills" => tab
+                            .claude_config
+                            .skills
+                            .get(idx)
+                            .map(|i| i.file_path.clone()),
+                        "plugins" => tab
+                            .claude_config
+                            .plugins
+                            .get(idx)
+                            .map(|i| i.file_path.clone()),
+                        "mcp_servers" => tab
+                            .claude_config
+                            .mcp_servers
+                            .get(idx)
+                            .map(|i| i.file_path.clone()),
+                        "hooks" => tab
+                            .claude_config
+                            .hooks
+                            .get(idx)
+                            .map(|i| i.file_path.clone()),
+                        "settings" => tab
+                            .claude_config
+                            .settings
+                            .get(idx)
+                            .map(|i| i.file_path.clone()),
                         _ => None,
                     };
                     if let Some(path) = file_path {
@@ -3275,31 +4137,43 @@ fi
                 }
             }
             Event::NavigateDir(path) => {
-                let show_hidden = self.show_hidden;
+                let mut request: Option<(usize, PathBuf)> = None;
                 if let Some(tab) = self.active_tab_mut() {
-                    tab.current_dir = path;
-                    tab.fetch_file_tree(show_hidden);
+                    tab.current_dir = path.clone();
+                    request = Some((tab.id, path));
+                }
+                if let Some((tab_id, dir)) = request {
+                    self.mark_workspaces_dirty();
+                    return Self::request_file_tree(tab_id, dir, self.show_hidden);
                 }
             }
             Event::NavigateUp => {
-                let show_hidden = self.show_hidden;
+                let mut request: Option<(usize, PathBuf)> = None;
                 if let Some(tab) = self.active_tab_mut() {
                     if let Some(parent) = tab.current_dir.parent() {
                         // Don't go above repo root
                         if parent.starts_with(&tab.repo_path) || parent == tab.repo_path {
-                            tab.current_dir = parent.to_path_buf();
-                            tab.fetch_file_tree(show_hidden);
+                            let next_dir = parent.to_path_buf();
+                            tab.current_dir = next_dir.clone();
+                            request = Some((tab.id, next_dir));
                         }
                     }
+                }
+                if let Some((tab_id, dir)) = request {
+                    self.mark_workspaces_dirty();
+                    return Self::request_file_tree(tab_id, dir, self.show_hidden);
                 }
             }
             Event::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.save_config();
-                let show_hidden = self.show_hidden;
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.sidebar_mode == SidebarMode::Files {
-                        tab.fetch_file_tree(show_hidden);
+                        return Self::request_file_tree(
+                            tab.id,
+                            tab.current_dir.clone(),
+                            self.show_hidden,
+                        );
                     }
                 }
             }
@@ -3329,7 +4203,8 @@ fi
                 }
                 if self.dragging_console_divider {
                     // Console height = distance from bottom of window to mouse position
-                    let new_height = (self.window_size.1 - y).clamp(32.0, self.window_size.1 - 140.0);
+                    let new_height =
+                        (self.window_size.1 - y).clamp(32.0, self.window_size.1 - 140.0);
                     self.console_height = new_height;
 
                     // Update WebView bounds if active
@@ -3347,7 +4222,9 @@ fi
                     let has_right = self.active_workspace_idx + 1 < self.workspaces.len();
 
                     let near_left = has_left && content_x >= 0.0 && content_x < EDGE_PEEK_ZONE;
-                    let near_right = has_right && content_x > content_width - EDGE_PEEK_ZONE && content_x <= content_width;
+                    let near_right = has_right
+                        && content_x > content_width - EDGE_PEEK_ZONE
+                        && content_x <= content_width;
 
                     if near_left != self.edge_peek_left || near_right != self.edge_peek_right {
                         self.edge_peek_left = near_left;
@@ -3358,6 +4235,7 @@ fi
             Event::ViewFile(path) => {
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
+                let mut request: Option<(usize, PathBuf)> = None;
 
                 // Hide WebView if switching to non-markdown
                 if !is_markdown && webview::is_active() {
@@ -3368,7 +4246,15 @@ fi
                     // Clear git selection if any
                     tab.selected_file = None;
                     tab.diff_lines.clear();
-                    tab.load_file(&path, is_dark_theme);
+                    tab.viewing_file_path = Some(path.clone());
+                    tab.file_content.clear();
+                    tab.image_handle = None;
+                    tab.webview_content = None;
+                    request = Some((tab.id, path));
+                }
+                if let Some((tab_id, file_path)) = request {
+                    self.mark_log_server_dirty();
+                    return Self::request_file_load(tab_id, file_path, is_dark_theme);
                 }
 
                 // Markdown uses Iced-native renderer inline; WebView only for "View in Browser"
@@ -3386,6 +4272,7 @@ fi
                     tab.image_handle = None;
                     tab.webview_content = None;
                 }
+                self.mark_log_server_dirty();
             }
             Event::CopyFileContent => {
                 if let Some(tab) = self.active_tab() {
@@ -3396,13 +4283,12 @@ fi
                 }
             }
             Event::OpenFileInBrowser => {
+                self.mark_log_server_dirty();
                 if let Some(tab) = self.active_tab() {
                     if tab.viewing_file_path.is_some() && !tab.file_content.is_empty() {
                         if let Some(base_url) = self.log_server_state.base_url() {
                             let url = format!("{}/file/{}", base_url, tab.id);
-                            let _ = std::process::Command::new("open")
-                                .arg(&url)
-                                .spawn();
+                            let _ = std::process::Command::new("open").arg(&url).spawn();
                         }
                     }
                 }
@@ -3417,11 +4303,7 @@ fi
                 if let Some(tab) = self.active_tab_mut() {
                     if let Some(path) = &tab.viewing_file_path.clone() {
                         if TabState::is_markdown_file(path) {
-                            tab.load_file(path, is_dark);
-                            // Update WebView content
-                            if let Some(html) = &tab.webview_content {
-                                webview::update_content(html);
-                            }
+                            return Self::request_file_load(tab.id, path.clone(), is_dark);
                         }
                     }
                 }
@@ -3447,7 +4329,7 @@ fi
                     if let Some(term) = &mut tab.terminal {
                         // Send the clear command to the terminal
                         term.handle(iced_term::Command::ProxyToBackend(
-                            iced_term::backend::Command::Write(b"clear\n".to_vec())
+                            iced_term::backend::Command::Write(b"clear\n".to_vec()),
                         ));
                     }
                 }
@@ -3501,7 +4383,8 @@ fi
             Event::SearchNext => {
                 if let Some(tab) = self.active_tab_mut() {
                     if !tab.search.matches.is_empty() {
-                        tab.search.current_match = (tab.search.current_match + 1) % tab.search.matches.len();
+                        tab.search.current_match =
+                            (tab.search.current_match + 1) % tab.search.matches.len();
                         if let Some(term) = &mut tab.terminal {
                             let current = &tab.search.matches[tab.search.current_match];
                             term.scroll_to_line(current.start.line.0);
@@ -3549,9 +4432,7 @@ fi
                             // Open in default browser
                             #[cfg(target_os = "macos")]
                             {
-                                let _ = std::process::Command::new("open")
-                                    .arg(&temp_path)
-                                    .spawn();
+                                let _ = std::process::Command::new("open").arg(&temp_path).spawn();
                             }
                             #[cfg(target_os = "linux")]
                             {
@@ -3574,6 +4455,11 @@ fi
                 // Kill all console processes
                 for ws in &mut self.workspaces {
                     ws.console.kill_process();
+                }
+                if self.workspaces_dirty {
+                    self.save_workspaces();
+                    self.workspaces_dirty = false;
+                    self.next_workspace_save_at = None;
                 }
                 // Signal the log server to shut down
                 self.log_server_state.shutdown.notify_one();
@@ -3602,7 +4488,10 @@ fi
                 let scroll_task = iced::advanced::widget::operate(
                     iced::advanced::widget::operation::scrollable::scroll_to(
                         workspace_scrollable_id().into(),
-                        scrollable::AbsoluteOffset { x: Some(new_target), y: None },
+                        scrollable::AbsoluteOffset {
+                            x: Some(new_target),
+                            y: None,
+                        },
                     ),
                 );
 
@@ -3613,6 +4502,172 @@ fi
                 }
 
                 return scroll_task;
+            }
+            Event::GitStatusLoaded(snapshot) => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == snapshot.tab_id)
+                {
+                    if tab.repo_path == snapshot.repo_path {
+                        tab.repo_name = snapshot.repo_name;
+                        tab.branch_name = snapshot.branch_name;
+                        tab.is_git_repo = snapshot.is_git_repo;
+                        tab.staged = snapshot.staged;
+                        tab.unstaged = snapshot.unstaged;
+                        tab.untracked = snapshot.untracked;
+                        tab.last_poll = Instant::now();
+                    }
+                }
+            }
+            Event::FileTreeLoaded(snapshot) => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == snapshot.tab_id)
+                {
+                    if tab.current_dir == snapshot.current_dir {
+                        tab.file_tree = snapshot.entries;
+                    }
+                }
+            }
+            Event::DiffLoaded(snapshot) => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == snapshot.tab_id)
+                {
+                    if tab.selected_file.as_deref() == Some(snapshot.file_path.as_str())
+                        && tab.selected_is_staged == snapshot.is_staged
+                    {
+                        tab.diff_lines = snapshot.lines;
+                    }
+                }
+            }
+            Event::FileLoaded(snapshot) => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == snapshot.tab_id)
+                {
+                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path) {
+                        tab.file_content = snapshot.file_content;
+                        tab.webview_content = snapshot.webview_content;
+                        tab.image_handle =
+                            snapshot.image_path.as_ref().map(image::Handle::from_path);
+                        if let Some(html) = &tab.webview_content {
+                            webview::update_content(html);
+                        }
+                        self.mark_log_server_dirty();
+                    }
+                }
+            }
+            Event::LogServerSyncComplete => {
+                self.log_server_sync_in_flight = false;
+                if self.log_server_sync_queued {
+                    self.log_server_sync_queued = false;
+                    self.log_server_dirty = true;
+                }
+                if self.log_server_dirty {
+                    return self.queue_log_server_sync();
+                }
+            }
+            Event::SttToggle => {
+                if !self.stt_enabled {
+                    return Task::none();
+                }
+                if self.stt_transcribing {
+                    // Already transcribing, ignore
+                    return Task::none();
+                }
+                if self.stt_recording {
+                    // Stop recording, start transcription
+                    self.stt_recording = false;
+                    // Drop the stream to stop recording
+                    self.stt_stream = None;
+                    // Take the buffer
+                    let samples = {
+                        let mut buf = self.stt_audio_buffer.lock().unwrap();
+                        std::mem::take(&mut *buf)
+                    };
+                    if samples.is_empty() {
+                        return Task::none();
+                    }
+                    self.stt_transcribing = true;
+                    // Lazy-init whisper context
+                    if self.stt_context.is_none() {
+                        let model_path = stt_model_path();
+                        if !model_path.exists() {
+                            self.stt_transcribing = false;
+                            eprintln!(
+                                "[STT] Model not found. Download it with:\n  \
+                                 mkdir -p ~/.config/gitterm/models && \\\n  \
+                                 curl -L -o ~/.config/gitterm/models/ggml-base.en.bin \\\n  \
+                                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+                            );
+                            return Task::none();
+                        }
+                        match whisper_rs::WhisperContext::new_with_params(
+                            model_path.to_str().unwrap(),
+                            whisper_rs::WhisperContextParameters::default(),
+                        ) {
+                            Ok(ctx) => {
+                                self.stt_context = Some(Arc::new(ctx));
+                            }
+                            Err(e) => {
+                                self.stt_transcribing = false;
+                                eprintln!("[STT] Failed to load model: {}", e);
+                                return Task::none();
+                            }
+                        }
+                    }
+                    let ctx = self.stt_context.clone().unwrap();
+                    let sample_rate = self.stt_sample_rate;
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || stt_transcribe(ctx, samples, sample_rate))
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Join error: {}", e)))
+                        },
+                        |result| match result {
+                            Ok(text) => Event::SttTranscriptReady(text),
+                            Err(e) => Event::SttError(e),
+                        },
+                    );
+                } else {
+                    // Start recording
+                    match stt_start_recording(self.stt_audio_buffer.clone()) {
+                        Ok((stream, sample_rate)) => {
+                            self.stt_recording = true;
+                            self.stt_stream = Some(stream);
+                            self.stt_sample_rate = sample_rate;
+                        }
+                        Err(e) => {
+                            eprintln!("[STT] Failed to start recording: {}", e);
+                        }
+                    }
+                }
+            }
+            Event::SttTranscriptReady(text) => {
+                self.stt_transcribing = false;
+                if !text.is_empty() {
+                    // Inject transcribed text into the active tab's terminal
+                    if let Some(tab) = self.active_tab_mut() {
+                        if let Some(term) = &mut tab.terminal {
+                            term.handle(iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(text.into_bytes()),
+                            ));
+                        }
+                    }
+                }
+            }
+            Event::SttError(e) => {
+                self.stt_transcribing = false;
+                eprintln!("[STT] Error: {}", e);
             }
             Event::WorkspaceSelect(idx) => {
                 webview::set_visible(false);
@@ -3629,7 +4684,7 @@ fi
 
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
 
                     // Refresh claude config if active tab is in Claude mode
                     if let Some(tab) = self.active_tab_mut() {
@@ -3642,7 +4697,10 @@ fi
                     let slide_task = iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
                             workspace_scrollable_id().into(),
-                            scrollable::AbsoluteOffset { x: Some(self.slide_start_offset), y: None },
+                            scrollable::AbsoluteOffset {
+                                x: Some(self.slide_start_offset),
+                                y: None,
+                            },
                         ),
                     );
                     let bar_task = self.scroll_to_active_workspace_bar();
@@ -3673,8 +4731,8 @@ fi
                     let elapsed = start_time.elapsed().as_millis() as f32;
                     let t = (elapsed / SLIDE_DURATION_MS).min(1.0);
                     let eased = 1.0 - (1.0 - t).powi(3);
-                    self.slide_offset =
-                        self.slide_start_offset + (self.slide_target - self.slide_start_offset) * eased;
+                    self.slide_offset = self.slide_start_offset
+                        + (self.slide_target - self.slide_start_offset) * eased;
 
                     if t >= 1.0 {
                         self.slide_offset = self.slide_target;
@@ -3686,7 +4744,10 @@ fi
                     return iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
                             workspace_scrollable_id().into(),
-                            scrollable::AbsoluteOffset { x: Some(offset_x), y: None },
+                            scrollable::AbsoluteOffset {
+                                x: Some(offset_x),
+                                y: None,
+                            },
                         ),
                     );
                 }
@@ -3716,7 +4777,7 @@ fi
                         let nearest = nearest.min(self.workspaces.len().saturating_sub(1));
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
-                            self.save_workspaces();
+                            self.mark_workspaces_dirty();
                             webview::set_visible(false);
                             self.editing_console_command = None;
                         }
@@ -3732,7 +4793,8 @@ fi
                     if self.active_workspace_idx >= self.workspaces.len() {
                         self.active_workspace_idx = self.workspaces.len() - 1;
                     }
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
 
                     // Snap slide to new active workspace (no animation)
                     let viewport_width = self.content_viewport_width();
@@ -3745,7 +4807,10 @@ fi
                     return iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
                             workspace_scrollable_id().into(),
-                            scrollable::AbsoluteOffset { x: Some(new_target), y: None },
+                            scrollable::AbsoluteOffset {
+                                x: Some(new_target),
+                                y: None,
+                            },
                         ),
                     );
                 }
@@ -3767,13 +4832,19 @@ fi
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Workspace".to_string());
-                let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
+                let used_colors: Vec<WorkspaceColor> =
+                    self.workspaces.iter().map(|ws| ws.color).collect();
                 let color = WorkspaceColor::next_available(&used_colors);
                 let mut workspace = Workspace::new(name, path.clone(), color);
-                self.add_tab_to_workspace_with_command(&mut workspace, path, Some("claude".to_string()));
+                self.add_tab_to_workspace_with_command(
+                    &mut workspace,
+                    path,
+                    Some("claude".to_string()),
+                );
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
-                self.save_workspaces();
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
 
                 // Snap slide state to new workspace position
                 // (no scroll_to needed — view renders active workspace directly when not animating)
@@ -3783,6 +4854,9 @@ fi
                 self.slide_target = new_target;
                 self.slide_animating = false;
                 self.slide_start_time = None;
+                if let Some(tab) = self.active_tab() {
+                    return Self::request_git_status(tab.id, tab.repo_path.clone());
+                }
             }
             Event::WorkspaceCreated(None) => {}
             // Console panel events
@@ -3802,7 +4876,8 @@ fi
             Event::ConsoleStart => {
                 if let Some(ws) = self.active_workspace_mut() {
                     // Use active tab's directory (tracks terminal cwd), fall back to workspace root
-                    let dir = ws.active_tab()
+                    let dir = ws
+                        .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     ws.console.detected_url = None;
@@ -3820,7 +4895,8 @@ fi
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.console.kill_process();
                     ws.console.detected_url = None;
-                    let dir = ws.active_tab()
+                    let dir = ws
+                        .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     ws.console.spawn_process(&dir);
@@ -3873,7 +4949,8 @@ fi
                 self.dragging_console_divider = true;
             }
             Event::ConsoleCommandEditStart => {
-                let current = self.active_workspace()
+                let current = self
+                    .active_workspace()
                     .and_then(|ws| ws.console.run_command.clone())
                     .unwrap_or_default();
                 self.editing_console_command = Some(current);
@@ -3894,7 +4971,7 @@ fi
                             }
                         }
                     }
-                    self.save_workspaces();
+                    self.mark_workspaces_dirty();
                 }
             }
             Event::ConsoleCommandCancel => {
@@ -3916,14 +4993,17 @@ fi
                     return Task::none();
                 }
                 let start_ws = self.active_workspace_idx;
-                let start_tab = self.workspaces.get(start_ws)
+                let start_tab = self
+                    .workspaces
+                    .get(start_ws)
                     .map(|ws| ws.active_tab)
                     .unwrap_or(0);
 
                 // Search from (current_ws, current_tab + 1), wrapping around all workspaces/tabs
                 let mut ws_idx = start_ws;
                 let mut tab_idx = start_tab + 1;
-                for _ in 0..(ws_count * 100) { // upper bound to prevent infinite loop
+                for _ in 0..(ws_count * 100) {
+                    // upper bound to prevent infinite loop
                     if let Some(ws) = self.workspaces.get(ws_idx) {
                         if tab_idx < ws.tabs.len() {
                             if ws.tabs[tab_idx].needs_attention {
@@ -3939,7 +5019,7 @@ fi
                                     self.active_workspace_idx = ws_idx;
                                 }
                                 self.workspaces[ws_idx].active_tab = tab_idx;
-                                self.save_workspaces();
+                                self.mark_workspaces_dirty();
                                 return self.scroll_to_active_tab();
                             }
                             tab_idx += 1;
@@ -3962,7 +5042,7 @@ fi
     /// Calculate WebView bounds based on current layout
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
         let tab_bar_height = 33.0; // tabs row (~24px buttons + 8px padding) + 1px separator
-        let header_height = 45.0;  // file viewer header
+        let header_height = 45.0; // file viewer header
         let workspace_bar_height = 28.0; // bottom workspace bar + 1px border
         let x = if self.sidebar_collapsed {
             SPINE_WIDTH + 36.0 + 1.0 // spine + icon rail + border
@@ -3988,15 +5068,12 @@ fi
         let font_size = self.terminal_font_size;
 
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
-            let settings = Self::build_terminal_settings(
-                &tab.repo_path,
-                None,
-                scrollback,
-                &theme,
-                font_size,
-            );
+            let settings =
+                Self::build_terminal_settings(&tab.repo_path, None, scrollback, &theme, font_size);
             if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
-                terminal.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
+                terminal.handle(iced_term::Command::AddBindings(
+                    Self::standard_noop_bindings(),
+                ));
                 tab.terminal = Some(terminal);
                 tab.created_at = Instant::now();
             }
@@ -4005,17 +5082,16 @@ fi
         // Recreate bottom panel terminals
         for ws in self.workspaces.iter_mut() {
             for bt in ws.bottom_terminals.iter_mut() {
-                let settings = Self::build_terminal_settings(
-                    &bt.cwd,
-                    None,
-                    scrollback,
-                    &theme,
-                    font_size,
-                );
-                bt.terminal = iced_term::Terminal::new(bt.id as u64, settings).ok().map(|mut t| {
-                    t.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
-                    t
-                });
+                let settings =
+                    Self::build_terminal_settings(&bt.cwd, None, scrollback, &theme, font_size);
+                bt.terminal = iced_term::Terminal::new(bt.id as u64, settings)
+                    .ok()
+                    .map(|mut t| {
+                        t.handle(iced_term::Command::AddBindings(
+                            Self::standard_noop_bindings(),
+                        ));
+                        t
+                    });
             }
         }
     }
@@ -4026,7 +5102,10 @@ fi
         let content = self.view_workspace_slide();
         let console_panel = self.view_bottom_panel();
 
-        let mut main_col = Column::new().spacing(0).width(Length::Fill).height(Length::Fill);
+        let mut main_col = Column::new()
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
         main_col = main_col.push(tab_bar);
         main_col = main_col.push(content);
 
@@ -4058,12 +5137,11 @@ fi
         let workspace_bar = self.view_workspace_bar();
         main_col = main_col.push(workspace_bar);
 
-        let main_view: Element<'_, Event, Theme, iced::Renderer> =
-            row![spine, main_col]
-                .spacing(0)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let main_view: Element<'_, Event, Theme, iced::Renderer> = row![spine, main_col]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
         if self.show_help {
             Stack::new()
@@ -4090,7 +5168,9 @@ fi
         let mono = iced::Font::with_name("Menlo");
 
         // Helper to build a shortcut row
-        let shortcut_row = |key_str: &'static str, desc_str: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
+        let shortcut_row = |key_str: &'static str,
+                            desc_str: &'static str|
+         -> Element<'_, Event, Theme, iced::Renderer> {
             row![
                 container(text(key_str).size(13).color(text_primary).font(mono))
                     .width(Length::Fixed(180.0)),
@@ -4103,7 +5183,12 @@ fi
 
         let section_header = |title: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
             container(text(title).size(12).color(accent).font(mono))
-                .padding(iced::Padding { top: 8.0, right: 0.0, bottom: 4.0, left: 0.0 })
+                .padding(iced::Padding {
+                    top: 8.0,
+                    right: 0.0,
+                    bottom: 4.0,
+                    left: 0.0,
+                })
                 .into()
         };
 
@@ -4111,8 +5196,14 @@ fi
 
         // Title
         content_col = content_col.push(
-            container(text("Keyboard Shortcuts").size(18).color(text_primary))
-                .padding(iced::Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 }),
+            container(text("Keyboard Shortcuts").size(18).color(text_primary)).padding(
+                iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 12.0,
+                    left: 0.0,
+                },
+            ),
         );
 
         // Navigation
@@ -4154,8 +5245,17 @@ fi
 
         // Footer
         content_col = content_col.push(
-            container(text("Press Option+/ or Esc to close").size(12).color(text_muted))
-                .padding(iced::Padding { top: 12.0, right: 0.0, bottom: 0.0, left: 0.0 }),
+            container(
+                text("Press Option+/ or Esc to close")
+                    .size(12)
+                    .color(text_muted),
+            )
+            .padding(iced::Padding {
+                top: 12.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            }),
         );
 
         // Card
@@ -4196,7 +5296,11 @@ fi
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
-            let text_color = if is_active { ws_color } else { theme.overlay0() };
+            let text_color = if is_active {
+                ws_color
+            } else {
+                theme.overlay0()
+            };
             let active_bg = theme.bg_base();
             let hover_bg = theme.surface0();
 
@@ -4208,7 +5312,11 @@ fi
             let dot_color = if has_error {
                 theme.danger()
             } else if has_attention {
-                if pulse_bright { theme.peach() } else { theme.warning() }
+                if pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                }
             } else if is_active {
                 ws_color
             } else {
@@ -4231,34 +5339,48 @@ fi
                 .color(text_color)
                 .font(iced::Font::with_name("Menlo"));
 
-            let mut btn_content = row![dot, label]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
+            let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
 
             // Attention/error badge
             if has_error {
                 let badge_bg = theme.danger();
                 let badge_text_color = theme.bg_crust();
                 btn_content = btn_content.push(
-                    container(text("!").size(9).color(badge_text_color).font(iced::Font::with_name("Menlo")))
-                        .padding([0, 4])
-                        .style(move |_| container::Style {
-                            background: Some(badge_bg.into()),
-                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                    container(
+                        text("!")
+                            .size(9)
+                            .color(badge_text_color)
+                            .font(iced::Font::with_name("Menlo")),
+                    )
+                    .padding([0, 4])
+                    .style(move |_| container::Style {
+                        background: Some(badge_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
                             ..Default::default()
-                        }),
+                        },
+                        ..Default::default()
+                    }),
                 );
             } else if has_attention {
                 let badge_bg = theme.peach();
                 let badge_text_color = theme.bg_crust();
                 btn_content = btn_content.push(
-                    container(text(format!("{}", attn_count)).size(9).color(badge_text_color).font(iced::Font::with_name("Menlo")))
-                        .padding([0, 4])
-                        .style(move |_| container::Style {
-                            background: Some(badge_bg.into()),
-                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                    container(
+                        text(format!("{}", attn_count))
+                            .size(9)
+                            .color(badge_text_color)
+                            .font(iced::Font::with_name("Menlo")),
+                    )
+                    .padding([0, 4])
+                    .style(move |_| container::Style {
+                        background: Some(badge_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
                             ..Default::default()
-                        }),
+                        },
+                        ..Default::default()
+                    }),
                 );
             }
 
@@ -4324,7 +5446,10 @@ fi
         let ws_add_color = theme.overlay0();
         let ws_add_hover = theme.overlay1();
         let ws_add_btn = button(
-            text("+ workspace").size(11).color(ws_add_color).font(iced::Font::with_name("Menlo")),
+            text("+ workspace")
+                .size(11)
+                .color(ws_add_color)
+                .font(iced::Font::with_name("Menlo")),
         )
         .style(move |_theme, status| {
             let tc = if matches!(status, button::Status::Hovered) {
@@ -4342,36 +5467,34 @@ fi
         .on_press(Event::WorkspaceCreate);
         bar_row = bar_row.push(ws_add_btn);
 
-        let scrollable_bar = scrollable(
-            bar_row.padding([0, 4]).align_y(iced::Alignment::Center),
-        )
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(0).scroller_width(0),
-        ))
-        .id(workspace_bar_scrollable_id())
-        .width(Length::Fill)
-        .style(|_theme, _status| {
-            let transparent_rail = scrollable::Rail {
-                background: None,
-                border: iced::Border::default(),
-                scroller: scrollable::Scroller {
-                    background: iced::Color::TRANSPARENT.into(),
+        let scrollable_bar = scrollable(bar_row.padding([0, 4]).align_y(iced::Alignment::Center))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .id(workspace_bar_scrollable_id())
+            .width(Length::Fill)
+            .style(|_theme, _status| {
+                let transparent_rail = scrollable::Rail {
+                    background: None,
                     border: iced::Border::default(),
-                },
-            };
-            scrollable::Style {
-                container: container::Style::default(),
-                vertical_rail: transparent_rail,
-                horizontal_rail: transparent_rail,
-                gap: None,
-                auto_scroll: scrollable::AutoScroll {
-                    background: iced::Color::TRANSPARENT.into(),
-                    border: iced::Border::default(),
-                    shadow: iced::Shadow::default(),
-                    icon: iced::Color::TRANSPARENT,
-                },
-            }
-        });
+                    scroller: scrollable::Scroller {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                    },
+                };
+                scrollable::Style {
+                    container: container::Style::default(),
+                    vertical_rail: transparent_rail,
+                    horizontal_rail: transparent_rail,
+                    gap: None,
+                    auto_scroll: scrollable::AutoScroll {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        icon: iced::Color::TRANSPARENT,
+                    },
+                }
+            });
 
         let bg = theme.bg_crust();
         let top_border_color = theme.surface0();
@@ -4388,7 +5511,10 @@ fi
         let help_color = theme.overlay0();
         let help_hover = theme.overlay1();
         let help_btn = button(
-            text("?").size(11).color(help_color).font(iced::Font::with_name("Menlo")),
+            text("?")
+                .size(11)
+                .color(help_color)
+                .font(iced::Font::with_name("Menlo")),
         )
         .style(move |_theme, status| {
             let tc = if matches!(status, button::Status::Hovered) {
@@ -4410,12 +5536,13 @@ fi
             .align_y(iced::Alignment::Center)
             .width(Length::Fill);
 
-        let bar_container = container(bar_inner)
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let bar_container =
+            container(bar_inner)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(bg.into()),
+                    ..Default::default()
+                });
 
         column![top_border, bar_container].into()
     }
@@ -4446,7 +5573,11 @@ fi
             let dot_color = if has_error && !is_active {
                 theme.danger()
             } else if has_attention && !is_active {
-                if pulse_bright { theme.peach() } else { theme.warning() }
+                if pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                }
             } else if is_active {
                 ws_color
             } else {
@@ -4494,17 +5625,13 @@ fi
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
 
-        let spine_content = container(
-            container(dots)
-                .height(Length::Fill)
-                .center_y(Length::Fill),
-        )
-        .width(Length::Fixed(SPINE_WIDTH))
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        });
+        let spine_content = container(container(dots).height(Length::Fill).center_y(Length::Fill))
+            .width(Length::Fixed(SPINE_WIDTH))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
 
         // Right border as a separate 1px column
         let border_line = container(iced::widget::Space::new().width(0).height(0))
@@ -4526,7 +5653,10 @@ fi
 
         // Left edge peek indicator
         if self.edge_peek_left {
-            if let Some(left_ws) = self.workspaces.get(self.active_workspace_idx.wrapping_sub(1)) {
+            if let Some(left_ws) = self
+                .workspaces
+                .get(self.active_workspace_idx.wrapping_sub(1))
+            {
                 let ws_color = left_ws.color.color(theme);
                 let peek_btn = button(
                     text(format!("\u{2039} {}", left_ws.name))
@@ -4566,7 +5696,11 @@ fi
 
             // Icon prefix — attention overrides normal icon
             let (icon_str, icon_color) = if has_attention {
-                let attn_color = if pulse_bright { theme.peach() } else { theme.warning() };
+                let attn_color = if pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                };
                 ("● ", attn_color)
             } else if is_claude {
                 ("✦ ", theme.peach())
@@ -4579,7 +5713,11 @@ fi
                 .terminal_title
                 .as_ref()
                 .map(|t| {
-                    let display = if has_attention { t.trim_start_matches('*').trim_start() } else { t.as_str() };
+                    let display = if has_attention {
+                        t.trim_start_matches('*').trim_start()
+                    } else {
+                        t.as_str()
+                    };
                     if display.len() > 20 {
                         format!("{}…", &display[..19])
                     } else {
@@ -4598,11 +5736,20 @@ fi
 
             // Attention background colors
             let attn_bg_color = if pulse_bright {
-                iced::Color { a: 0.20, ..theme.peach() }
+                iced::Color {
+                    a: 0.20,
+                    ..theme.peach()
+                }
             } else {
-                iced::Color { a: 0.12, ..theme.peach() }
+                iced::Color {
+                    a: 0.12,
+                    ..theme.peach()
+                }
             };
-            let attn_border_color = iced::Color { a: 0.5, ..theme.peach() };
+            let attn_border_color = iced::Color {
+                a: 0.5,
+                ..theme.peach()
+            };
 
             // Build tab content: icon + label + shortcut
             let mut tab_content = Row::new().spacing(0).align_y(iced::Alignment::Center);
@@ -4678,8 +5825,11 @@ fi
                 .padding([4, 4])
                 .on_press(Event::TabClose(idx));
 
-            tabs_row = tabs_row
-                .push(row![tab_btn, close_btn].spacing(0).align_y(iced::Alignment::Center));
+            tabs_row = tabs_row.push(
+                row![tab_btn, close_btn]
+                    .spacing(0)
+                    .align_y(iced::Alignment::Center),
+            );
         }
 
         // Add tab button
@@ -4703,41 +5853,60 @@ fi
         tabs_row = tabs_row.push(add_btn);
 
         // Wrap tabs in a horizontal scrollable
-        let scrollable_tabs = scrollable(
-            tabs_row
-                .padding([4, 8])
-                .align_y(iced::Alignment::Center),
-        )
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(0).scroller_width(0),
-        ))
-        .id(tab_scrollable_id())
-        .width(Length::Fill)
-        .style(|_theme, _status| {
-            let transparent_rail = scrollable::Rail {
-                background: None,
-                border: iced::Border::default(),
-                scroller: scrollable::Scroller {
-                    background: iced::Color::TRANSPARENT.into(),
+        let scrollable_tabs = scrollable(tabs_row.padding([4, 8]).align_y(iced::Alignment::Center))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .id(tab_scrollable_id())
+            .width(Length::Fill)
+            .style(|_theme, _status| {
+                let transparent_rail = scrollable::Rail {
+                    background: None,
                     border: iced::Border::default(),
-                },
-            };
-            scrollable::Style {
-                container: container::Style::default(),
-                vertical_rail: transparent_rail,
-                horizontal_rail: transparent_rail,
-                gap: None,
-                auto_scroll: scrollable::AutoScroll {
-                    background: iced::Color::TRANSPARENT.into(),
-                    border: iced::Border::default(),
-                    shadow: iced::Shadow::default(),
-                    icon: iced::Color::TRANSPARENT,
-                },
-            }
-        });
+                    scroller: scrollable::Scroller {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                    },
+                };
+                scrollable::Style {
+                    container: container::Style::default(),
+                    vertical_rail: transparent_rail,
+                    horizontal_rail: transparent_rail,
+                    gap: None,
+                    auto_scroll: scrollable::AutoScroll {
+                        background: iced::Color::TRANSPARENT.into(),
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        icon: iced::Color::TRANSPARENT,
+                    },
+                }
+            });
 
         // === Right section: fixed workspace metadata ===
         let mut metadata_row = Row::new().spacing(4);
+
+        // STT mic indicator
+        if self.stt_enabled {
+            let (mic_icon, mic_color) = if self.stt_recording {
+                // Pulsing red/peach mic when recording
+                let c = if self.attention_pulse_bright {
+                    theme.danger()
+                } else {
+                    theme.peach()
+                };
+                ("\u{25CF} REC", c)  // ● REC
+            } else if self.stt_transcribing {
+                ("\u{2026}", theme.warning())  // … (processing)
+            } else {
+                ("\u{25CB}", theme.overlay0())  // ○ grey idle
+            };
+            metadata_row = metadata_row.push(
+                text(mic_icon)
+                    .size(11)
+                    .color(mic_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
 
         if let Some(ws) = self.active_workspace() {
             let ws_color = ws.color.color(theme);
@@ -4815,12 +5984,13 @@ fi
             )
             .align_y(iced::Alignment::Center);
 
-        let tab_container = container(combined_row)
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let tab_container =
+            container(combined_row)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(bg.into()),
+                    ..Default::default()
+                });
 
         // Bottom border as separator
         let separator = container(iced::widget::Space::new().height(0))
@@ -4834,7 +6004,10 @@ fi
         column![tab_container, separator].into()
     }
 
-    fn view_workspace_content<'a>(&'a self, ws: &'a Workspace) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_workspace_content<'a>(
+        &'a self,
+        ws: &'a Workspace,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
             let main_panel = if tab.viewing_file_path.is_some() {
@@ -4892,7 +6065,9 @@ fi
             let bg = theme.bg_base();
             container(
                 column![
-                    text("No repository open").size(16).color(theme.text_primary()),
+                    text("No repository open")
+                        .size(16)
+                        .color(theme.text_primary()),
                     button(text("Open Folder").size(14))
                         .style(button::primary)
                         .padding([8, 16])
@@ -4991,10 +6166,7 @@ fi
             .into()
     }
 
-    fn view_sidebar<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_sidebar<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut content = Column::new().spacing(0);
 
@@ -5034,26 +6206,37 @@ fi
 
         let modes = [
             ("\u{2387}", SidebarMode::Git),    // ⎇ branch symbol
-            ("\u{1F4C1}", SidebarMode::Files),  // 📁 folder
-            ("\u{2726}", SidebarMode::Claude),   // ✦ sparkle
+            ("\u{1F4C1}", SidebarMode::Files), // 📁 folder
+            ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
         ];
 
         let mut rail_col = Column::new().spacing(0).width(Length::Fixed(rail_width));
 
         for (label, mode) in &modes {
             let is_active = tab.sidebar_mode == *mode;
-            let text_color = if is_active { theme.text_primary() } else { theme.overlay1() };
+            let text_color = if is_active {
+                theme.text_primary()
+            } else {
+                theme.overlay1()
+            };
             let accent = theme.accent();
             let hover_bg = theme.surface0();
 
             // Active indicator: accent bar on the left edge
-            let indicator_color = if is_active { accent } else { iced::Color::TRANSPARENT };
+            let indicator_color = if is_active {
+                accent
+            } else {
+                iced::Color::TRANSPARENT
+            };
             let indicator = container(iced::widget::Space::new())
                 .width(Length::Fixed(2.0))
                 .height(Length::Fixed(24.0))
                 .style(move |_| container::Style {
                     background: Some(indicator_color.into()),
-                    border: iced::Border { radius: 1.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 1.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
 
@@ -5099,7 +6282,7 @@ fi
         let hover_bg = theme.surface0();
         let expand_btn = button(
             container(text("\u{25B6}").size(10).color(chevron_color))
-                .center_x(Length::Fixed(rail_width))
+                .center_x(Length::Fixed(rail_width)),
         )
         .style(move |_theme, status| {
             let bg = if matches!(status, button::Status::Hovered) {
@@ -5137,8 +6320,16 @@ fi
         on_press: Event,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let text_color = if is_active { theme.text_primary() } else { theme.overlay1() };
-        let underline_color = if is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+        let text_color = if is_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+        let underline_color = if is_active {
+            theme.accent()
+        } else {
+            iced::Color::TRANSPARENT
+        };
         let hover_bg = theme.surface0();
 
         let tab_btn = button(label)
@@ -5167,7 +6358,10 @@ fi
                 ..Default::default()
             });
 
-        column![tab_btn, underline].spacing(0).width(Length::FillPortion(1)).into()
+        column![tab_btn, underline]
+            .spacing(0)
+            .width(Length::FillPortion(1))
+            .into()
     }
 
     fn view_sidebar_toggle<'a>(
@@ -5183,19 +6377,29 @@ fi
         let claude_active = tab.sidebar_mode == SidebarMode::Claude;
 
         // Git tab label with optional badge
-        let git_text_color = if git_active { theme.text_primary() } else { theme.overlay1() };
+        let git_text_color = if git_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
         let mut git_label: Row<'_, Event, Theme, iced::Renderer> =
             Row::new().spacing(4).align_y(iced::Alignment::Center);
         git_label = git_label.push(text("Git").size(font).color(git_text_color));
 
         if changes > 0 {
-            let badge_bg = iced::Color { a: 0.2, ..theme.warning() };
+            let badge_bg = iced::Color {
+                a: 0.2,
+                ..theme.warning()
+            };
             let warning_color = theme.warning();
             let badge = container(text(format!("{}", changes)).size(10).color(warning_color))
                 .padding([1, 6])
                 .style(move |_| container::Style {
                     background: Some(badge_bg.into()),
-                    border: iced::Border { radius: 8.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
             git_label = git_label.push(badge);
@@ -5208,7 +6412,11 @@ fi
         );
 
         // Files tab
-        let files_text_color = if files_active { theme.text_primary() } else { theme.overlay1() };
+        let files_text_color = if files_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
         let files_tab = self.view_sidebar_tab(
             text("Files").size(font).color(files_text_color).into(),
             files_active,
@@ -5216,7 +6424,11 @@ fi
         );
 
         // Claude tab
-        let claude_text_color = if claude_active { theme.text_primary() } else { theme.overlay1() };
+        let claude_text_color = if claude_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
         let claude_tab = self.view_sidebar_tab(
             text("Claude").size(font).color(claude_text_color).into(),
             claude_active,
@@ -5229,7 +6441,7 @@ fi
         // Collapse chevron (same style as console toggle)
         let chevron_color = theme.overlay0();
         let collapse_chevron = button(
-            text("\u{25C0}").size(10).color(chevron_color) // ◀ left-pointing
+            text("\u{25C0}").size(10).color(chevron_color), // ◀ left-pointing
         )
         .style(|_theme, _status| button::Style {
             background: Some(iced::Color::TRANSPARENT.into()),
@@ -5284,12 +6496,14 @@ fi
         };
 
         // Path and hidden toggle
-        let hidden_label = if self.show_hidden { "Hide .*" } else { "Show .*" };
+        let hidden_label = if self.show_hidden {
+            "Hide .*"
+        } else {
+            "Show .*"
+        };
         content = content.push(
             row![
-                text(path_display)
-                    .size(font)
-                    .color(theme.accent()),
+                text(path_display).size(font).color(theme.accent()),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text(hidden_label).size(font_small))
                     .style(button::text)
@@ -5306,7 +6520,10 @@ fi
             content = content.push(
                 button(
                     row![
-                        text("..").size(font).color(muted).width(Length::Fixed(20.0)),
+                        text("..")
+                            .size(font)
+                            .color(muted)
+                            .width(Length::Fixed(20.0)),
                         text("(parent)").size(font_small).color(muted),
                     ]
                     .spacing(8),
@@ -5330,7 +6547,11 @@ fi
                 )
             } else {
                 // Files: colored by extension
-                let ext = entry.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let ext = entry
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
                 let file_color = match ext {
                     "ts" | "tsx" => theme.accent(),
                     "js" | "jsx" => theme.warning(),
@@ -5355,8 +6576,13 @@ fi
             };
 
             let entry_row = row![
-                text(icon).size(font).color(icon_color).width(Length::Fixed(24.0)),
-                text(format!("{}{}", entry.name, name_suffix)).size(font).color(name_color),
+                text(icon)
+                    .size(font)
+                    .color(icon_color)
+                    .width(Length::Fixed(24.0)),
+                text(format!("{}{}", entry.name, name_suffix))
+                    .size(font)
+                    .color(name_color),
             ]
             .spacing(4);
 
@@ -5374,10 +6600,14 @@ fi
 
             // For files, add an edit button; for dirs, just use the nav button
             let btn: Element<'a, Event, Theme, iced::Renderer> = if !entry.is_dir {
-                let edit_btn = button(text("\u{270e}").size(font_small).color(theme.text_secondary()))
-                    .style(button::text)
-                    .padding([4, 6])
-                    .on_press(Event::EditFile(entry.path.clone()));
+                let edit_btn = button(
+                    text("\u{270e}")
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                )
+                .style(button::text)
+                .padding([4, 6])
+                .on_press(Event::EditFile(entry.path.clone()));
                 row![file_btn, edit_btn]
                     .align_y(iced::Alignment::Center)
                     .into()
@@ -5386,14 +6616,12 @@ fi
             };
 
             if let Some(bg) = bg_color {
-                content = content.push(
-                    container(btn)
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            ..Default::default()
-                        }),
-                );
+                content = content.push(container(btn).width(Length::Fill).style(move |_| {
+                    container::Style {
+                        background: Some(bg.into()),
+                        ..Default::default()
+                    }
+                }));
             } else {
                 content = content.push(btn);
             }
@@ -5424,32 +6652,52 @@ fi
 
         // Skills section
         content = content.push(self.view_claude_section(
-            "Skills", "skills", &config.skills, config.expanded.contains("skills"),
-            theme.success(), &config.selected_item,
+            "Skills",
+            "skills",
+            &config.skills,
+            config.expanded.contains("skills"),
+            theme.success(),
+            &config.selected_item,
         ));
 
         // Plugins section
         content = content.push(self.view_claude_section(
-            "Plugins", "plugins", &config.plugins, config.expanded.contains("plugins"),
-            theme.accent(), &config.selected_item,
+            "Plugins",
+            "plugins",
+            &config.plugins,
+            config.expanded.contains("plugins"),
+            theme.accent(),
+            &config.selected_item,
         ));
 
         // MCP Servers section
         content = content.push(self.view_claude_section(
-            "MCP Servers", "mcp_servers", &config.mcp_servers, config.expanded.contains("mcp_servers"),
-            theme.peach(), &config.selected_item,
+            "MCP Servers",
+            "mcp_servers",
+            &config.mcp_servers,
+            config.expanded.contains("mcp_servers"),
+            theme.peach(),
+            &config.selected_item,
         ));
 
         // Hooks section
         content = content.push(self.view_claude_section(
-            "Hooks", "hooks", &config.hooks, config.expanded.contains("hooks"),
-            theme.mauve(), &config.selected_item,
+            "Hooks",
+            "hooks",
+            &config.hooks,
+            config.expanded.contains("hooks"),
+            theme.mauve(),
+            &config.selected_item,
         ));
 
         // Settings section
         content = content.push(self.view_claude_section(
-            "Settings", "settings", &config.settings, config.expanded.contains("settings"),
-            theme.overlay1(), &config.selected_item,
+            "Settings",
+            "settings",
+            &config.settings,
+            config.expanded.contains("settings"),
+            theme.overlay1(),
+            &config.selected_item,
         ));
 
         scrollable(content)
@@ -5476,13 +6724,19 @@ fi
         let count_text = format!("{}", items.len());
 
         // Count badge
-        let badge_bg = iced::Color { a: 0.15, ..theme.text_muted() };
+        let badge_bg = iced::Color {
+            a: 0.15,
+            ..theme.text_muted()
+        };
         let muted = theme.text_muted();
         let badge = container(text(count_text).size(font_small).color(muted))
             .padding([1, 6])
             .style(move |_| container::Style {
                 background: Some(badge_bg.into()),
-                border: iced::Border { radius: 8.0.into(), ..Default::default() },
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             });
 
@@ -5523,14 +6777,22 @@ fi
                     .as_ref()
                     .map(|(s, i)| s == key && *i == idx)
                     .unwrap_or(false);
-                section = section.push(self.view_claude_item(key, idx, item, dot_color, is_selected));
+                section =
+                    section.push(self.view_claude_item(key, idx, item, dot_color, is_selected));
             }
 
             if items.is_empty() {
                 let empty_row = container(
-                    text("None found").size(font_small).color(theme.text_muted()),
+                    text("None found")
+                        .size(font_small)
+                        .color(theme.text_muted()),
                 )
-                .padding(iced::Padding { top: 4.0, right: 10.0, bottom: 4.0, left: 28.0 });
+                .padding(iced::Padding {
+                    top: 4.0,
+                    right: 10.0,
+                    bottom: 4.0,
+                    left: 28.0,
+                });
                 section = section.push(empty_row);
             }
         }
@@ -5556,7 +6818,11 @@ fi
             iced::Color::TRANSPARENT
         };
         let accent = theme.accent();
-        let left_border_color = if is_selected { accent } else { iced::Color::TRANSPARENT };
+        let left_border_color = if is_selected {
+            accent
+        } else {
+            iced::Color::TRANSPARENT
+        };
         let hover_bg = theme.surface0();
 
         // Scope badge text
@@ -5565,15 +6831,25 @@ fi
             ConfigScope::Project => "PRJ",
         };
 
-        let scope_bg = iced::Color { a: 0.12, ..theme.text_muted() };
+        let scope_bg = iced::Color {
+            a: 0.12,
+            ..theme.text_muted()
+        };
         let scope_text_color = theme.text_muted();
-        let scope_badge = container(text(scope_str).size(font_small - 1.0).color(scope_text_color))
-            .padding([1, 4])
-            .style(move |_| container::Style {
-                background: Some(scope_bg.into()),
-                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+        let scope_badge = container(
+            text(scope_str)
+                .size(font_small - 1.0)
+                .color(scope_text_color),
+        )
+        .padding([1, 4])
+        .style(move |_| container::Style {
+            background: Some(scope_bg.into()),
+            border: iced::Border {
+                radius: 4.0.into(),
                 ..Default::default()
-            });
+            },
+            ..Default::default()
+        });
 
         // Dot
         let dot = container(iced::widget::Space::new())
@@ -5581,7 +6857,10 @@ fi
             .height(Length::Fixed(6.0))
             .style(move |_| container::Style {
                 background: Some(dot_color.into()),
-                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             });
 
@@ -5593,7 +6872,12 @@ fi
             scope_badge,
         ]
         .align_y(iced::Alignment::Center)
-        .padding(iced::Padding { top: 4.0, right: 10.0, bottom: 4.0, left: 24.0 });
+        .padding(iced::Padding {
+            top: 4.0,
+            right: 10.0,
+            bottom: 4.0,
+            left: 24.0,
+        });
 
         let item_btn = button(item_row)
             .style(move |_theme, status| {
@@ -5624,9 +6908,7 @@ fi
                 ..Default::default()
             });
 
-        row![left_border, item_btn]
-            .height(Length::Shrink)
-            .into()
+        row![left_border, item_btn].height(Length::Shrink).into()
     }
 
     fn view_file_content<'a>(
@@ -5667,7 +6949,9 @@ fi
                     .padding([4, 8])
                     .on_press(Event::OpenMarkdownInBrowser),
                 iced::widget::Space::new().width(Length::Fixed(8.0)),
-                text("Esc: close").size(font_small).color(theme.text_secondary()),
+                text("Esc: close")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
                 iced::widget::Space::new().width(Length::Fixed(16.0)),
                 button(text("Close").size(font))
                     .style(button::secondary)
@@ -5690,7 +6974,9 @@ fi
                     .padding([4, 8])
                     .on_press(Event::OpenFileInBrowser),
                 iced::widget::Space::new().width(Length::Fixed(8.0)),
-                text("Esc: close").size(font_small).color(theme.text_secondary()),
+                text("Esc: close")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
                 iced::widget::Space::new().width(Length::Fixed(16.0)),
                 button(text("Close").size(font))
                     .style(button::secondary)
@@ -5701,27 +6987,27 @@ fi
             .spacing(8)
         };
 
-        content = content.push(
-            container(header)
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(header_bg.into()),
-                    ..Default::default()
-                }),
-        );
+        content =
+            content.push(
+                container(header)
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(header_bg.into()),
+                        ..Default::default()
+                    }),
+            );
 
         // Check if we're viewing an image
         if let Some(handle) = &tab.image_handle {
             // Display image
-            let img = image(handle.clone())
-                .content_fit(iced::ContentFit::Contain);
+            let img = image(handle.clone()).content_fit(iced::ContentFit::Contain);
 
             content = content.push(
                 scrollable(
                     container(img)
                         .width(Length::Fill)
                         .center_x(Length::Fill)
-                        .padding(16)
+                        .padding(16),
                 )
                 .height(Length::Fill)
                 .width(Length::Fill),
@@ -5751,9 +7037,7 @@ fi
                         .size(font)
                         .color(theme.text_muted())
                         .font(iced::Font::MONOSPACE),
-                    text(" ")
-                        .size(font)
-                        .font(iced::Font::MONOSPACE),
+                    text(" ").size(font).font(iced::Font::MONOSPACE),
                     text(line)
                         .size(font)
                         .color(line_color)
@@ -5761,11 +7045,8 @@ fi
                 ]
                 .spacing(0);
 
-                file_column = file_column.push(
-                    container(line_row)
-                        .width(Length::Fill)
-                        .padding([1, 4]),
-                );
+                file_column =
+                    file_column.push(container(line_row).width(Length::Fill).padding([1, 4]));
             }
 
             if tab.file_content.is_empty() {
@@ -5840,19 +7121,17 @@ fi
                                 .color(theme.text_primary()),
                         );
                     }
-                    content = content.push(
-                        container(code_col)
-                            .width(Length::Fill)
-                            .padding(12)
-                            .style(move |_| container::Style {
+                    content =
+                        content.push(container(code_col).width(Length::Fill).padding(12).style(
+                            move |_| container::Style {
                                 background: Some(code_bg.into()),
                                 border: iced::Border {
                                     radius: 6.0.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
-                            }),
-                    );
+                            },
+                        ));
                     code_block_content.clear();
                     in_code_block = false;
                 } else {
@@ -5863,9 +7142,7 @@ fi
                         content = content.push(
                             container(
                                 column![
-                                    text("Mermaid Diagram")
-                                        .size(font)
-                                        .color(theme.accent()),
+                                    text("Mermaid Diagram").size(font).color(theme.accent()),
                                     text("Click \"View in Browser\" to see the rendered diagram")
                                         .size(font - 2.0)
                                         .color(theme.text_secondary()),
@@ -5907,11 +7184,7 @@ fi
             // Headers
             if trimmed.starts_with("######") {
                 let header_text = trimmed.strip_prefix("######").unwrap_or("").trim();
-                content = content.push(
-                    text(header_text)
-                        .size(font)
-                        .color(theme.text_primary()),
-                );
+                content = content.push(text(header_text).size(font).color(theme.text_primary()));
             } else if trimmed.starts_with("#####") {
                 let header_text = trimmed.strip_prefix("#####").unwrap_or("").trim();
                 content = content.push(
@@ -5976,15 +7249,15 @@ fi
                 let border_color = theme.border();
                 content = content.push(
                     container(self.parse_inline_markdown(quote_text, font))
-                    .padding([8, 16])
-                    .style(move |_| container::Style {
-                        border: iced::Border {
-                            color: border_color,
-                            width: 0.0,
-                            radius: 0.0.into(),
-                        },
-                        ..Default::default()
-                    }),
+                        .padding([8, 16])
+                        .style(move |_| container::Style {
+                            border: iced::Border {
+                                color: border_color,
+                                width: 0.0,
+                                radius: 0.0.into(),
+                            },
+                            ..Default::default()
+                        }),
                 );
             }
             // Horizontal rule
@@ -6005,7 +7278,9 @@ fi
                 let list_text = &trimmed[2..];
                 content = content.push(
                     row![
-                        text("  \u{2022}  ").size(font).color(theme.text_secondary()),
+                        text("  \u{2022}  ")
+                            .size(font)
+                            .color(theme.text_secondary()),
                         self.parse_inline_markdown(list_text, font),
                     ]
                     .spacing(0),
@@ -6013,7 +7288,10 @@ fi
                 in_list = true;
             }
             // Task lists
-            else if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+            else if trimmed.starts_with("- [ ] ")
+                || trimmed.starts_with("- [x] ")
+                || trimmed.starts_with("- [X] ")
+            {
                 let is_checked = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]");
                 let task_text = &trimmed[6..];
                 let checkbox = if is_checked { "\u{2611}" } else { "\u{2610}" };
@@ -6021,20 +7299,33 @@ fi
                     row![
                         text(format!("  {}  ", checkbox))
                             .size(font)
-                            .color(if is_checked { theme.success() } else { theme.text_secondary() }),
+                            .color(if is_checked {
+                                theme.success()
+                            } else {
+                                theme.text_secondary()
+                            }),
                         text(task_text).size(font).color(theme.text_primary()),
                     ]
                     .spacing(0),
                 );
             }
             // Ordered lists (basic)
-            else if trimmed.len() > 2 && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && trimmed.contains(". ") {
+            else if trimmed.len() > 2
+                && trimmed
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                && trimmed.contains(". ")
+            {
                 if let Some(pos) = trimmed.find(". ") {
                     let num = &trimmed[..pos];
                     let list_text = &trimmed[pos + 2..];
                     content = content.push(
                         row![
-                            text(format!("  {}.  ", num)).size(font).color(theme.text_secondary()),
+                            text(format!("  {}.  ", num))
+                                .size(font)
+                                .color(theme.text_secondary()),
                             self.parse_inline_markdown(list_text, font),
                         ]
                         .spacing(0),
@@ -6092,7 +7383,10 @@ fi
         let font_small = font - 1.0;
         let border_color = theme.border();
         let header_bg = theme.bg_surface();
-        let alt_bg = iced::Color { a: 0.3, ..theme.bg_surface() };
+        let alt_bg = iced::Color {
+            a: 0.3,
+            ..theme.bg_surface()
+        };
 
         let mut table_col = Column::new().spacing(0);
 
@@ -6168,11 +7462,21 @@ fi
         let accent_color = theme.accent();
         let secondary_color = theme.text_secondary();
         let mono = iced::Font::MONOSPACE;
-        let bold_font = iced::Font { weight: iced::font::Weight::Bold, ..Default::default() };
+        let bold_font = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
 
         // Quick check: if no special chars, return plain text
-        if !input.contains('`') && !input.contains('*') && !input.contains('_') && !input.contains('[') {
-            return text(input.to_string()).size(font_size).color(text_color).into();
+        if !input.contains('`')
+            && !input.contains('*')
+            && !input.contains('_')
+            && !input.contains('[')
+        {
+            return text(input.to_string())
+                .size(font_size)
+                .color(text_color)
+                .into();
         }
 
         type Span<'s> = iced::advanced::text::Span<'s, (), iced::Font>;
@@ -6196,7 +7500,9 @@ fi
                     code.push(chars[i]);
                     i += 1;
                 }
-                if i < len { i += 1; }
+                if i < len {
+                    i += 1;
+                }
                 let mut code_span = Span::new(code)
                     .font(mono)
                     .size(font_size - 1.0)
@@ -6204,7 +7510,10 @@ fi
                     .padding([0, 4]);
                 code_span.highlight = Some(iced::advanced::text::Highlight {
                     background: code_bg.into(),
-                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
                 });
                 spans.push(code_span);
             }
@@ -6224,7 +7533,9 @@ fi
                     bold_text.push(chars[i]);
                     i += 1;
                 }
-                if i + 1 < len { i += 2; }
+                if i + 1 < len {
+                    i += 2;
+                }
                 // Parse inner content for nested inline code
                 if bold_text.contains('`') {
                     let inner_chars: Vec<char> = bold_text.chars().collect();
@@ -6234,7 +7545,11 @@ fi
                     while j < inner_len {
                         if inner_chars[j] == '`' {
                             if !inner_current.is_empty() {
-                                spans.push(Span::new(inner_current.clone()).color(text_color).font(bold_font));
+                                spans.push(
+                                    Span::new(inner_current.clone())
+                                        .color(text_color)
+                                        .font(bold_font),
+                                );
                                 inner_current.clear();
                             }
                             j += 1;
@@ -6243,15 +7558,23 @@ fi
                                 code.push(inner_chars[j]);
                                 j += 1;
                             }
-                            if j < inner_len { j += 1; }
+                            if j < inner_len {
+                                j += 1;
+                            }
                             let mut code_span = Span::new(code)
-                                .font(iced::Font { weight: iced::font::Weight::Bold, ..mono })
+                                .font(iced::Font {
+                                    weight: iced::font::Weight::Bold,
+                                    ..mono
+                                })
                                 .size(font_size - 1.0)
                                 .color(text_color)
                                 .padding([0, 4]);
                             code_span.highlight = Some(iced::advanced::text::Highlight {
                                 background: code_bg.into(),
-                                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                                border: iced::Border {
+                                    radius: 3.0.into(),
+                                    ..Default::default()
+                                },
                             });
                             spans.push(code_span);
                         } else {
@@ -6281,7 +7604,9 @@ fi
                     italic_text.push(chars[i]);
                     i += 1;
                 }
-                if i < len { i += 1; }
+                if i < len {
+                    i += 1;
+                }
                 spans.push(Span::new(italic_text).color(secondary_color));
             }
             // Link: [text](url)
@@ -6296,15 +7621,20 @@ fi
                     link_text.push(chars[i]);
                     i += 1;
                 }
-                if i < len { i += 1; }
+                if i < len {
+                    i += 1;
+                }
                 if i < len && chars[i] == '(' {
                     i += 1;
-                    while i < len && chars[i] != ')' { i += 1; }
-                    if i < len { i += 1; }
+                    while i < len && chars[i] != ')' {
+                        i += 1;
+                    }
+                    if i < len {
+                        i += 1;
+                    }
                 }
                 spans.push(Span::new(link_text).color(accent_color).underline(true));
-            }
-            else {
+            } else {
                 current.push(chars[i]);
                 i += 1;
             }
@@ -6341,15 +7671,27 @@ fi
 
         match ext {
             "ts" | "tsx" | "js" | "jsx" => {
-                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with("*")
+                {
                     comment
                 } else if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
                     keyword
-                } else if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ") {
+                } else if trimmed.starts_with("const ")
+                    || trimmed.starts_with("let ")
+                    || trimmed.starts_with("var ")
+                {
                     declaration
-                } else if trimmed.starts_with("function ") || trimmed.starts_with("async ") || trimmed.contains("=>") {
+                } else if trimmed.starts_with("function ")
+                    || trimmed.starts_with("async ")
+                    || trimmed.contains("=>")
+                {
                     function
-                } else if trimmed.starts_with("return ") || trimmed.starts_with("if ") || trimmed.starts_with("else") {
+                } else if trimmed.starts_with("return ")
+                    || trimmed.starts_with("if ")
+                    || trimmed.starts_with("else")
+                {
                     control
                 } else {
                     default
@@ -6358,7 +7700,10 @@ fi
             "md" => {
                 if trimmed.starts_with('#') {
                     declaration
-                } else if trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with(|c: char| c.is_numeric()) {
+                } else if trimmed.starts_with('-')
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with(|c: char| c.is_numeric())
+                {
                     function
                 } else if trimmed.starts_with('>') {
                     comment
@@ -6371,7 +7716,10 @@ fi
             "rs" => {
                 if trimmed.starts_with("//") {
                     comment
-                } else if trimmed.starts_with("use ") || trimmed.starts_with("mod ") || trimmed.starts_with("pub ") {
+                } else if trimmed.starts_with("use ")
+                    || trimmed.starts_with("mod ")
+                    || trimmed.starts_with("pub ")
+                {
                     keyword
                 } else if trimmed.starts_with("fn ") || trimmed.starts_with("impl ") {
                     function
@@ -6394,16 +7742,13 @@ fi
         }
     }
 
-    fn view_git_list<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_git_list<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
         let mut content = Column::new().spacing(8).padding(8);
 
         // Branch display - styled rounded container with diamond icon
-        if Repository::open(&tab.repo_path).is_ok() {
+        if tab.is_git_repo {
             let branch_bg = theme.bg_base();
             let mauve = theme.mauve();
             let branch_container = container(
@@ -6475,7 +7820,7 @@ fi
         }
 
         if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
-            let msg = if Repository::open(&tab.repo_path).is_ok() {
+            let msg = if tab.is_git_repo {
                 "No changes"
             } else {
                 "Not a git repository"
@@ -6542,10 +7887,14 @@ fi
         }
 
         let full_path = tab.repo_path.join(&file.path);
-        let edit_btn = button(text("\u{270e}").size(font_small).color(theme.text_secondary()))
-            .style(button::text)
-            .padding([4, 6])
-            .on_press(Event::EditFile(full_path));
+        let edit_btn = button(
+            text("\u{270e}")
+                .size(font_small)
+                .color(theme.text_secondary()),
+        )
+        .style(button::text)
+        .padding([4, 6])
+        .on_press(Event::EditFile(full_path));
 
         row![select_btn, edit_btn]
             .align_y(iced::Alignment::Center)
@@ -6580,19 +7929,25 @@ fi
         .padding(8)
         .spacing(8);
 
-        content = content.push(
-            container(header).width(Length::Fill).style(move |_| container::Style {
-                background: Some(header_bg.into()),
-                ..Default::default()
-            }),
-        );
+        content =
+            content.push(
+                container(header)
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(header_bg.into()),
+                        ..Default::default()
+                    }),
+            );
 
         // Diff content
         let mut diff_column = Column::new().spacing(0);
 
         if tab.diff_lines.is_empty() {
-            diff_column =
-                diff_column.push(text("No diff available").size(font).color(theme.text_secondary()));
+            diff_column = diff_column.push(
+                text("No diff available")
+                    .size(font)
+                    .color(theme.text_secondary()),
+            );
         } else {
             for line in &tab.diff_lines {
                 diff_column = diff_column.push(self.view_diff_line(line));
@@ -6616,7 +7971,10 @@ fi
             .into()
     }
 
-    fn view_diff_line<'a>(&'a self, line: &'a DiffLine) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_diff_line<'a>(
+        &'a self,
+        line: &'a DiffLine,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
         let (line_color, bg_color) = match line.line_type {
@@ -6644,45 +8002,45 @@ fi
         };
 
         // Build content - either with inline changes or plain
-        let content_element: Element<'a, Event, Theme, iced::Renderer> =
-            if let Some(ref changes) = line.inline_changes {
-                // Build rich text with word-level highlighting
-                let mut content_row = Row::new().spacing(0);
-                for change in changes {
-                    let (change_color, change_bg) = match (&line.line_type, &change.change_type) {
-                        (DiffLineType::Deletion, ChangeType::Delete) => {
-                            (color!(0xffffff), Some(theme.diff_del_highlight()))
-                        }
-                        (DiffLineType::Addition, ChangeType::Insert) => {
-                            (color!(0xffffff), Some(theme.diff_add_highlight()))
-                        }
-                        _ => (line_color, None),
-                    };
-
-                    let change_text = text(&change.value)
-                        .size(font)
-                        .color(change_color)
-                        .font(iced::Font::MONOSPACE);
-
-                    if let Some(bg) = change_bg {
-                        content_row = content_row.push(
-                            container(change_text).style(move |_| container::Style {
-                                background: Some(bg.into()),
-                                ..Default::default()
-                            }),
-                        );
-                    } else {
-                        content_row = content_row.push(change_text);
+        let content_element: Element<'a, Event, Theme, iced::Renderer> = if let Some(ref changes) =
+            line.inline_changes
+        {
+            // Build rich text with word-level highlighting
+            let mut content_row = Row::new().spacing(0);
+            for change in changes {
+                let (change_color, change_bg) = match (&line.line_type, &change.change_type) {
+                    (DiffLineType::Deletion, ChangeType::Delete) => {
+                        (color!(0xffffff), Some(theme.diff_del_highlight()))
                     }
-                }
-                content_row.into()
-            } else {
-                text(&line.content)
+                    (DiffLineType::Addition, ChangeType::Insert) => {
+                        (color!(0xffffff), Some(theme.diff_add_highlight()))
+                    }
+                    _ => (line_color, None),
+                };
+
+                let change_text = text(&change.value)
                     .size(font)
-                    .color(line_color)
-                    .font(iced::Font::MONOSPACE)
-                    .into()
-            };
+                    .color(change_color)
+                    .font(iced::Font::MONOSPACE);
+
+                if let Some(bg) = change_bg {
+                    content_row =
+                        content_row.push(container(change_text).style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            ..Default::default()
+                        }));
+                } else {
+                    content_row = content_row.push(change_text);
+                }
+            }
+            content_row.into()
+        } else {
+            text(&line.content)
+                .size(font)
+                .color(line_color)
+                .font(iced::Font::MONOSPACE)
+                .into()
+        };
 
         let line_num_color = theme.text_muted();
         let line_row = if line.line_type == DiffLineType::Header {
@@ -6720,34 +8078,37 @@ fi
         }
     }
 
-    fn view_terminal<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_terminal<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
 
         let bg = theme.bg_base();
-        let terminal_view: Element<'a, Event, Theme, iced::Renderer> = if let Some(term) = &tab.terminal {
-            let tab_id = tab.id;
-            let term_container = container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(4)
-                .style(move |_| container::Style {
-                    background: Some(bg.into()),
-                    ..Default::default()
-                });
-            iced::widget::mouse_area(term_container)
-                .on_press(Event::MainTerminalClicked)
-                .into()
-        } else {
-            container(text("Terminal unavailable").size(14).color(theme.text_secondary()))
+        let terminal_view: Element<'a, Event, Theme, iced::Renderer> =
+            if let Some(term) = &tab.terminal {
+                let tab_id = tab.id;
+                let term_container =
+                    container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .padding(4)
+                        .style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            ..Default::default()
+                        });
+                iced::widget::mouse_area(term_container)
+                    .on_press(Event::MainTerminalClicked)
+                    .into()
+            } else {
+                container(
+                    text("Terminal unavailable")
+                        .size(14)
+                        .color(theme.text_secondary()),
+                )
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
-        };
+            };
 
         // Stack search bar on top of terminal when active
         if tab.search.is_active {
@@ -6842,22 +8203,28 @@ fi
         .into()
     }
 
-    fn view_bottom_tab_bar<'a>(&'a self, ws: &'a Workspace, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_bottom_tab_bar<'a>(
+        &'a self,
+        ws: &'a Workspace,
+        console: &'a ConsoleState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let active_tab = ws.active_bottom_tab;
 
         // Chevron button (toggle expand/collapse)
-        let chevron = if self.console_expanded { "\u{25BC}" } else { "\u{25B6}" };
+        let chevron = if self.console_expanded {
+            "\u{25BC}"
+        } else {
+            "\u{25B6}"
+        };
         let chevron_color = theme.overlay0();
-        let chevron_btn = button(
-            text(chevron).size(10).color(chevron_color)
-        )
-        .style(|_theme, _status| button::Style {
-            background: Some(iced::Color::TRANSPARENT.into()),
-            ..Default::default()
-        })
-        .padding([4, 6])
-        .on_press(Event::ConsoleToggle);
+        let chevron_btn = button(text(chevron).size(10).color(chevron_color))
+            .style(|_theme, _status| button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                ..Default::default()
+            })
+            .padding([4, 6])
+            .on_press(Event::ConsoleToggle);
 
         // --- Console tab button ---
         let console_is_active = active_tab == BottomPanelTab::Console;
@@ -6871,20 +8238,40 @@ fi
             .height(Length::Fixed(6.0))
             .style(move |_| container::Style {
                 background: Some(dot_color.into()),
-                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             });
 
-        let console_label_color = if console_is_active { theme.text_primary() } else { theme.overlay1() };
-        let console_tab_bg = if console_is_active { theme.bg_overlay() } else { iced::Color::TRANSPARENT };
+        let console_label_color = if console_is_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+        let console_tab_bg = if console_is_active {
+            theme.bg_overlay()
+        } else {
+            iced::Color::TRANSPARENT
+        };
         let console_hover_bg = theme.surface0();
-        let console_active_accent = if console_is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+        let console_active_accent = if console_is_active {
+            theme.accent()
+        } else {
+            iced::Color::TRANSPARENT
+        };
 
         let console_tab_btn = button(
             row![
                 status_dot,
-                text("Console").size(12).color(console_label_color).font(iced::Font::with_name("Menlo"))
-            ].spacing(5).align_y(iced::Alignment::Center)
+                text("Console")
+                    .size(12)
+                    .color(console_label_color)
+                    .font(iced::Font::with_name("Menlo"))
+            ]
+            .spacing(5)
+            .align_y(iced::Alignment::Center),
         )
         .style(move |_theme, status| {
             let bg = if matches!(status, button::Status::Hovered) && !console_is_active {
@@ -6916,23 +8303,44 @@ fi
                     background: Some(console_active_accent.into()),
                     ..Default::default()
                 })
-        ].spacing(0).into();
+        ]
+        .spacing(0)
+        .into();
 
         // --- Terminal tab buttons ---
         let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
         for (idx, bt) in ws.bottom_terminals.iter().enumerate() {
             let is_active = active_tab == BottomPanelTab::Terminal(idx);
-            let label: String = bt.title.clone().unwrap_or_else(|| format!("Terminal {}", idx + 1));
-            let label_color = if is_active { theme.text_primary() } else { theme.overlay1() };
-            let tab_bg = if is_active { theme.bg_overlay() } else { iced::Color::TRANSPARENT };
+            let label: String = bt
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Terminal {}", idx + 1));
+            let label_color = if is_active {
+                theme.text_primary()
+            } else {
+                theme.overlay1()
+            };
+            let tab_bg = if is_active {
+                theme.bg_overlay()
+            } else {
+                iced::Color::TRANSPARENT
+            };
             let tab_hover_bg = theme.surface0();
-            let active_accent = if is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+            let active_accent = if is_active {
+                theme.accent()
+            } else {
+                iced::Color::TRANSPARENT
+            };
 
             let close_color = theme.overlay0();
             let close_hover = theme.text_primary();
             let close_btn = button(text("\u{00D7}").size(12).color(close_color))
                 .style(move |_theme, status| {
-                    let c = if matches!(status, button::Status::Hovered) { close_hover } else { close_color };
+                    let c = if matches!(status, button::Status::Hovered) {
+                        close_hover
+                    } else {
+                        close_color
+                    };
                     button::Style {
                         background: Some(iced::Color::TRANSPARENT.into()),
                         text_color: c,
@@ -6944,9 +8352,17 @@ fi
 
             let tab_btn = button(
                 row![
-                    text(">_").size(10).color(label_color).font(iced::Font::with_name("Menlo")),
-                    text(label).size(12).color(label_color).font(iced::Font::with_name("Menlo")),
-                ].spacing(4).align_y(iced::Alignment::Center)
+                    text(">_")
+                        .size(10)
+                        .color(label_color)
+                        .font(iced::Font::with_name("Menlo")),
+                    text(label)
+                        .size(12)
+                        .color(label_color)
+                        .font(iced::Font::with_name("Menlo")),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
             )
             .style(move |_theme, status| {
                 let bg = if matches!(status, button::Status::Hovered) && !is_active {
@@ -6968,7 +8384,9 @@ fi
             .on_press(Event::BottomTabSelect(BottomPanelTab::Terminal(idx)));
 
             let tab_with_close: Element<'a, Event, Theme, iced::Renderer> = column![
-                row![tab_btn, close_btn].spacing(0).align_y(iced::Alignment::Center),
+                row![tab_btn, close_btn]
+                    .spacing(0)
+                    .align_y(iced::Alignment::Center),
                 container(iced::widget::Space::new())
                     .width(Length::Fill)
                     .height(Length::Fixed(2.0))
@@ -6976,7 +8394,9 @@ fi
                         background: Some(active_accent.into()),
                         ..Default::default()
                     })
-            ].spacing(0).into();
+            ]
+            .spacing(0)
+            .into();
 
             tab_buttons.push(tab_with_close);
         }
@@ -6993,7 +8413,10 @@ fi
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
                     text_color: plus_color,
                     ..Default::default()
                 }
@@ -7020,59 +8443,66 @@ fi
         // Console-specific controls on the right
         if console_is_active {
             // Process name — click to edit, or show text input when editing
-            let name_element: Element<'a, Event, Theme, iced::Renderer> = if let Some(edit_val) = &self.editing_console_command {
-                let input_bg = theme.bg_base();
-                let input_border = theme.accent();
-                text_input("e.g. cargo run, bun run dev", edit_val)
-                    .on_input(Event::ConsoleCommandChanged)
-                    .on_submit(Event::ConsoleCommandSubmit)
-                    .size(12)
-                    .width(Length::Fixed(220.0))
-                    .padding([3, 6])
-                    .style(move |_theme, _status| text_input::Style {
-                        background: input_bg.into(),
-                        border: iced::Border {
-                            width: 1.0,
-                            color: input_border,
-                            radius: 3.0.into(),
-                        },
-                        icon: iced::Color::TRANSPARENT,
-                        placeholder: theme.overlay0(),
-                        value: theme.text_primary(),
-                        selection: theme.accent(),
-                    })
-                    .into()
-            } else {
-                let process_name = console.run_command.as_deref().unwrap_or("Click to set command");
-                let name_color = if console.run_command.is_some() {
-                    theme.text_primary()
-                } else {
-                    theme.overlay0()
-                };
-                let hover_bg = theme.surface0();
-                button(
-                    text(process_name)
+            let name_element: Element<'a, Event, Theme, iced::Renderer> =
+                if let Some(edit_val) = &self.editing_console_command {
+                    let input_bg = theme.bg_base();
+                    let input_border = theme.accent();
+                    text_input("e.g. cargo run, bun run dev", edit_val)
+                        .on_input(Event::ConsoleCommandChanged)
+                        .on_submit(Event::ConsoleCommandSubmit)
                         .size(12)
-                        .color(name_color)
-                        .font(iced::Font::with_name("Menlo"))
-                )
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        hover_bg
+                        .width(Length::Fixed(220.0))
+                        .padding([3, 6])
+                        .style(move |_theme, _status| text_input::Style {
+                            background: input_bg.into(),
+                            border: iced::Border {
+                                width: 1.0,
+                                color: input_border,
+                                radius: 3.0.into(),
+                            },
+                            icon: iced::Color::TRANSPARENT,
+                            placeholder: theme.overlay0(),
+                            value: theme.text_primary(),
+                            selection: theme.accent(),
+                        })
+                        .into()
+                } else {
+                    let process_name = console
+                        .run_command
+                        .as_deref()
+                        .unwrap_or("Click to set command");
+                    let name_color = if console.run_command.is_some() {
+                        theme.text_primary()
                     } else {
-                        iced::Color::TRANSPARENT
+                        theme.overlay0()
                     };
-                    button::Style {
-                        background: Some(bg.into()),
-                        border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                        text_color: name_color,
-                        ..Default::default()
-                    }
-                })
-                .padding([2, 4])
-                .on_press(Event::ConsoleCommandEditStart)
-                .into()
-            };
+                    let hover_bg = theme.surface0();
+                    button(
+                        text(process_name)
+                            .size(12)
+                            .color(name_color)
+                            .font(iced::Font::with_name("Menlo")),
+                    )
+                    .style(move |_theme, status| {
+                        let bg = if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        button::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            text_color: name_color,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 4])
+                    .on_press(Event::ConsoleCommandEditStart)
+                    .into()
+                };
 
             let uptime = console.uptime_string();
             let uptime_label = text(uptime)
@@ -7090,35 +8520,44 @@ fi
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
                     text_color: btn_color,
                     ..Default::default()
                 }
             };
 
-            let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> = if console.detected_url.is_some() {
-                let link_color = theme.accent();
-                let hover_bg_browser = theme.surface0();
-                Some(button(text("\u{1F517}").size(12).color(link_color))
-                    .style(move |_theme, status| {
-                        let bg = if matches!(status, button::Status::Hovered) {
-                            hover_bg_browser
-                        } else {
-                            iced::Color::TRANSPARENT
-                        };
-                        button::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                            text_color: link_color,
-                            ..Default::default()
-                        }
-                    })
-                    .padding([2, 6])
-                    .on_press(Event::ConsoleOpenBrowser)
-                    .into())
-            } else {
-                None
-            };
+            let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> =
+                if console.detected_url.is_some() {
+                    let link_color = theme.accent();
+                    let hover_bg_browser = theme.surface0();
+                    Some(
+                        button(text("\u{1F517}").size(12).color(link_color))
+                            .style(move |_theme, status| {
+                                let bg = if matches!(status, button::Status::Hovered) {
+                                    hover_bg_browser
+                                } else {
+                                    iced::Color::TRANSPARENT
+                                };
+                                button::Style {
+                                    background: Some(bg.into()),
+                                    border: iced::Border {
+                                        radius: 4.0.into(),
+                                        ..Default::default()
+                                    },
+                                    text_color: link_color,
+                                    ..Default::default()
+                                }
+                            })
+                            .padding([2, 6])
+                            .on_press(Event::ConsoleOpenBrowser)
+                            .into(),
+                    )
+                } else {
+                    None
+                };
 
             let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
                 .style(action_btn_style)
@@ -7141,7 +8580,10 @@ fi
                         };
                         button::Style {
                             background: Some(bg.into()),
-                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
                             text_color: stop_color,
                             ..Default::default()
                         }
@@ -7159,16 +8601,27 @@ fi
                         };
                         button::Style {
                             background: Some(bg.into()),
-                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
                             text_color: start_color,
                             ..Default::default()
                         }
                     })
                     .padding([2, 6])
-                    .on_press_maybe(if console.run_command.is_some() { Some(Event::ConsoleStart) } else { None })
+                    .on_press_maybe(if console.run_command.is_some() {
+                        Some(Event::ConsoleStart)
+                    } else {
+                        None
+                    })
             };
 
-            let search_icon_color = if console.search_visible { theme.accent() } else { btn_color };
+            let search_icon_color = if console.search_visible {
+                theme.accent()
+            } else {
+                btn_color
+            };
             let search_btn = button(text("\u{2315}").size(12).color(search_icon_color))
                 .style(action_btn_style)
                 .padding([2, 6])
@@ -7178,36 +8631,45 @@ fi
             if let Some(btn) = browser_btn {
                 header_row = header_row.push(btn);
             }
-            header_row = header_row.push(search_btn).push(clear_btn).push(restart_btn).push(stop_start_btn);
+            header_row = header_row
+                .push(search_btn)
+                .push(clear_btn)
+                .push(restart_btn)
+                .push(stop_start_btn);
         }
 
         let header_bg = theme.bg_surface();
         let top_border = theme.surface0();
 
         container(header_row)
-        .width(Length::Fill)
-        .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
-        .center_y(Length::Fixed(CONSOLE_HEADER_HEIGHT))
-        .style(move |_| container::Style {
-            background: Some(header_bg.into()),
-            border: iced::Border {
-                width: 1.0,
-                color: top_border,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+            .width(Length::Fill)
+            .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
+            .center_y(Length::Fixed(CONSOLE_HEADER_HEIGHT))
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: top_border,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
-    fn view_console_output<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_console_output<'a>(
+        &'a self,
+        console: &'a ConsoleState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
 
         if console.output_lines.is_empty() {
             // Show hint text
             let hint = if console.run_command.is_none() {
                 "No command configured for this workspace"
-            } else if console.status == ConsoleStatus::Stopped || console.status == ConsoleStatus::NoneConfigured {
+            } else if console.status == ConsoleStatus::Stopped
+                || console.status == ConsoleStatus::NoneConfigured
+            {
                 "Press \u{25B6} to start"
             } else {
                 "Waiting for output..."
@@ -7265,7 +8727,10 @@ fi
         }
     }
 
-    fn view_console_search_bar<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_console_search_bar<'a>(
+        &'a self,
+        console: &'a ConsoleState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
 
@@ -7286,15 +8751,14 @@ fi
             .width(Length::Fixed(200.0))
             .padding([4, 8]);
 
-        let match_text_color = if !console.search_query.is_empty() && console.matching_line_count() == 0 {
-            theme.danger()
-        } else {
-            theme.overlay1()
-        };
+        let match_text_color =
+            if !console.search_query.is_empty() && console.matching_line_count() == 0 {
+                theme.danger()
+            } else {
+                theme.overlay1()
+            };
 
-        let match_label = text(match_display)
-            .size(font)
-            .color(match_text_color);
+        let match_label = text(match_display).size(font).color(match_text_color);
 
         let close_color = theme.overlay1();
         let hover_bg = theme.surface0();
@@ -7307,7 +8771,10 @@ fi
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
                     text_color: close_color,
                     ..Default::default()
                 }
@@ -7353,7 +8820,11 @@ fi
                 "No matches".to_string()
             }
         } else {
-            format!("{}/{}", tab.search.current_match + 1, tab.search.matches.len())
+            format!(
+                "{}/{}",
+                tab.search.current_match + 1,
+                tab.search.matches.len()
+            )
         };
 
         let has_matches = !tab.search.matches.is_empty();
@@ -7366,14 +8837,30 @@ fi
             .padding([4, 8]);
 
         let prev_btn = button(text("<").size(font))
-            .style(if has_matches { button::secondary } else { button::text })
+            .style(if has_matches {
+                button::secondary
+            } else {
+                button::text
+            })
             .padding([4, 8])
-            .on_press_maybe(if has_matches { Some(Event::SearchPrev) } else { None });
+            .on_press_maybe(if has_matches {
+                Some(Event::SearchPrev)
+            } else {
+                None
+            });
 
         let next_btn = button(text(">").size(font))
-            .style(if has_matches { button::secondary } else { button::text })
+            .style(if has_matches {
+                button::secondary
+            } else {
+                button::text
+            })
             .padding([4, 8])
-            .on_press_maybe(if has_matches { Some(Event::SearchNext) } else { None });
+            .on_press_maybe(if has_matches {
+                Some(Event::SearchNext)
+            } else {
+                None
+            });
 
         let close_btn = button(text("x").size(font))
             .style(button::text)
@@ -7384,7 +8871,9 @@ fi
         container(
             row![
                 search_input,
-                text(match_display).size(font_small).color(theme.text_secondary()),
+                text(match_display)
+                    .size(font_small)
+                    .color(theme.text_secondary()),
                 prev_btn,
                 next_btn,
                 iced::widget::Space::new().width(Length::Fill),
