@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
+#[cfg(feature = "stt")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod log_server;
@@ -182,8 +184,10 @@ struct Config {
     console_height: f32,
     #[serde(default = "default_console_expanded")]
     console_expanded: bool,
+    #[cfg(feature = "stt")]
     #[serde(default = "default_stt_enabled")]
     stt_enabled: bool,
+    #[cfg(feature = "stt")]
     #[serde(default)]
     stt_model_path: Option<String>,
 }
@@ -206,6 +210,7 @@ fn default_console_height() -> f32 {
 fn default_console_expanded() -> bool {
     true
 }
+#[cfg(feature = "stt")]
 fn default_stt_enabled() -> bool {
     true
 }
@@ -222,7 +227,9 @@ impl Default for Config {
             show_hidden: false,
             console_height: DEFAULT_CONSOLE_HEIGHT,
             console_expanded: true,
+            #[cfg(feature = "stt")]
             stt_enabled: true,
+            #[cfg(feature = "stt")]
             stt_model_path: None,
         }
     }
@@ -559,6 +566,7 @@ impl AppTheme {
 
 // === Speech-to-Text helpers ===
 
+#[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -568,6 +576,7 @@ fn stt_model_path() -> PathBuf {
         .join("ggml-base.en.bin")
 }
 
+#[cfg(feature = "stt")]
 fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -639,6 +648,7 @@ fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stre
     Ok((stream, sample_rate))
 }
 
+#[cfg(feature = "stt")]
 fn stt_transcribe(
     ctx: Arc<whisper_rs::WhisperContext>,
     mono_samples: Vec<f32>,
@@ -765,7 +775,6 @@ struct ClaudeConfig {
     expanded: HashSet<String>,
     selected_item: Option<(String, usize)>,
 }
-
 
 // Inline change for word-level diffs
 #[derive(Debug, Clone)]
@@ -1212,9 +1221,7 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
     }
 
     // 5. Go project
-    if dir.join("go.mod").exists()
-        && (dir.join("main.go").exists() || dir.join("cmd").is_dir())
-    {
+    if dir.join("go.mod").exists() && (dir.join("main.go").exists() || dir.join("cmd").is_dir()) {
         return Some("go run .".to_string());
     }
 
@@ -2471,8 +2478,11 @@ pub enum Event {
     FileLoaded(FileLoadSnapshot),
     LogServerSyncComplete,
     // Speech-to-text events
+    #[cfg(feature = "stt")]
     SttToggle,
+    #[cfg(feature = "stt")]
     SttTranscriptReady(String),
+    #[cfg(feature = "stt")]
     SttError(String),
 }
 
@@ -2521,12 +2531,19 @@ struct App {
     log_server_sync_in_flight: bool,
     log_server_sync_queued: bool,
     // Speech-to-text state
+    #[cfg(feature = "stt")]
     stt_enabled: bool,
+    #[cfg(feature = "stt")]
     stt_recording: bool,
+    #[cfg(feature = "stt")]
     stt_context: Option<Arc<whisper_rs::WhisperContext>>,
+    #[cfg(feature = "stt")]
     stt_audio_buffer: Arc<Mutex<Vec<f32>>>,
+    #[cfg(feature = "stt")]
     stt_stream: Option<cpal::Stream>,
+    #[cfg(feature = "stt")]
     stt_sample_rate: u32,
+    #[cfg(feature = "stt")]
     stt_transcribing: bool,
 }
 
@@ -2667,7 +2684,9 @@ impl App {
             show_hidden: self.show_hidden,
             console_height: self.console_height,
             console_expanded: self.console_expanded,
+            #[cfg(feature = "stt")]
             stt_enabled: self.stt_enabled,
+            #[cfg(feature = "stt")]
             stt_model_path: None,
         };
         config.save();
@@ -2866,12 +2885,19 @@ impl App {
             log_server_sync_in_flight: false,
             log_server_sync_queued: false,
             // Speech-to-text
+            #[cfg(feature = "stt")]
             stt_enabled: config.stt_enabled,
+            #[cfg(feature = "stt")]
             stt_recording: false,
+            #[cfg(feature = "stt")]
             stt_context: None,
+            #[cfg(feature = "stt")]
             stt_audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "stt")]
             stt_stream: None,
+            #[cfg(feature = "stt")]
             stt_sample_rate: 48000,
+            #[cfg(feature = "stt")]
             stt_transcribing: false,
         };
 
@@ -3258,7 +3284,11 @@ fi
         }
 
         // Attention pulse (500ms toggle) — when any tab needs attention or STT recording
-        if self.any_tab_needs_attention() || self.stt_recording {
+        #[cfg(feature = "stt")]
+        let stt_recording = self.stt_recording;
+        #[cfg(not(feature = "stt"))]
+        let stt_recording = false;
+        if self.any_tab_needs_attention() || stt_recording {
             subs.push(
                 iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
             );
@@ -3943,6 +3973,7 @@ fi
                 }
 
                 // Ctrl+Space — toggle speech-to-text recording
+                #[cfg(feature = "stt")]
                 if modifiers.control()
                     && !modifiers.command()
                     && !modifiers.shift()
@@ -4557,6 +4588,7 @@ fi
                     return self.queue_log_server_sync();
                 }
             }
+            #[cfg(feature = "stt")]
             Event::SttToggle => {
                 if !self.stt_enabled {
                     return Task::none();
@@ -4635,6 +4667,7 @@ fi
                     }
                 }
             }
+            #[cfg(feature = "stt")]
             Event::SttTranscriptReady(text) => {
                 self.stt_transcribing = false;
                 if !text.is_empty() {
@@ -4648,6 +4681,7 @@ fi
                     }
                 }
             }
+            #[cfg(feature = "stt")]
             Event::SttError(e) => {
                 self.stt_transcribing = false;
                 eprintln!("[STT] Error: {}", e);
@@ -5869,6 +5903,7 @@ fi
         let mut metadata_row = Row::new().spacing(4);
 
         // STT mic indicator
+        #[cfg(feature = "stt")]
         if self.stt_enabled {
             let (mic_icon, mic_color) = if self.stt_recording {
                 // Pulsing red/peach mic when recording
@@ -8875,5 +8910,664 @@ fi
             ..Default::default()
         })
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // === ConsoleState::strip_ansi ===
+
+    #[test]
+    fn strip_ansi_plain_text() {
+        assert_eq!(ConsoleState::strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_color_codes() {
+        assert_eq!(
+            ConsoleState::strip_ansi("\x1b[31mred text\x1b[0m"),
+            "red text"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_bold() {
+        assert_eq!(ConsoleState::strip_ansi("\x1b[1mbold\x1b[0m"), "bold");
+    }
+
+    #[test]
+    fn strip_ansi_nested() {
+        assert_eq!(
+            ConsoleState::strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"),
+            "bold red"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_empty() {
+        assert_eq!(ConsoleState::strip_ansi(""), "");
+    }
+
+    // === ConsoleState::detect_url ===
+
+    #[test]
+    fn detect_url_http() {
+        assert_eq!(
+            ConsoleState::detect_url("Server at http://localhost:3000"),
+            Some("http://localhost:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_https_localhost() {
+        assert_eq!(
+            ConsoleState::detect_url("Running on https://localhost:8443/api"),
+            Some("https://localhost:8443/api".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_port_pattern() {
+        assert_eq!(
+            ConsoleState::detect_url("listening on :4000"),
+            Some("http://localhost:4000".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_on_port() {
+        assert_eq!(
+            ConsoleState::detect_url("Server started on port 8080"),
+            Some("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_no_match() {
+        assert_eq!(ConsoleState::detect_url("just some log output"), None);
+    }
+
+    #[test]
+    fn detect_url_in_ansi() {
+        assert_eq!(
+            ConsoleState::detect_url("\x1b[32mhttp://localhost:3000\x1b[0m"),
+            Some("http://localhost:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_trailing_punctuation() {
+        // Trailing quotes/parens should be trimmed from the URL
+        assert_eq!(
+            ConsoleState::detect_url("Visit http://localhost:5000)"),
+            Some("http://localhost:5000".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_http_ip() {
+        assert_eq!(
+            ConsoleState::detect_url("http://127.0.0.1:9090/health"),
+            Some("http://127.0.0.1:9090/health".to_string())
+        );
+    }
+
+    // === compute_word_diff ===
+
+    #[test]
+    fn word_diff_identical() {
+        let changes = compute_word_diff("hello world", "hello world");
+        assert!(changes.iter().all(|c| c.change_type == ChangeType::Equal));
+    }
+
+    #[test]
+    fn word_diff_insertion() {
+        let changes = compute_word_diff("hello", "hello world");
+        assert!(changes.iter().any(|c| c.change_type == ChangeType::Insert));
+    }
+
+    #[test]
+    fn word_diff_mixed() {
+        let changes = compute_word_diff("foo bar", "foo baz");
+        assert!(changes.iter().any(|c| c.change_type == ChangeType::Delete));
+        assert!(changes.iter().any(|c| c.change_type == ChangeType::Insert));
+    }
+
+    // === status_char ===
+
+    #[test]
+    fn status_char_staged_new() {
+        assert_eq!(status_char(Status::INDEX_NEW, true), "A");
+    }
+
+    #[test]
+    fn status_char_staged_modified() {
+        assert_eq!(status_char(Status::INDEX_MODIFIED, true), "M");
+    }
+
+    #[test]
+    fn status_char_staged_deleted() {
+        assert_eq!(status_char(Status::INDEX_DELETED, true), "D");
+    }
+
+    #[test]
+    fn status_char_staged_renamed() {
+        assert_eq!(status_char(Status::INDEX_RENAMED, true), "R");
+    }
+
+    #[test]
+    fn status_char_unstaged_modified() {
+        assert_eq!(status_char(Status::WT_MODIFIED, false), "M");
+    }
+
+    #[test]
+    fn status_char_unstaged_deleted() {
+        assert_eq!(status_char(Status::WT_DELETED, false), "D");
+    }
+
+    // === TabState::is_image_file / is_markdown_file ===
+
+    #[test]
+    fn is_image_png() {
+        assert!(TabState::is_image_file(Path::new("photo.png")));
+    }
+
+    #[test]
+    fn is_image_txt() {
+        assert!(!TabState::is_image_file(Path::new("readme.txt")));
+    }
+
+    #[test]
+    fn is_image_no_extension() {
+        assert!(!TabState::is_image_file(Path::new("Makefile")));
+    }
+
+    #[test]
+    fn is_image_case_insensitive() {
+        assert!(TabState::is_image_file(Path::new("photo.PNG")));
+        assert!(TabState::is_image_file(Path::new("photo.JpEg")));
+    }
+
+    #[test]
+    fn is_markdown_md() {
+        assert!(TabState::is_markdown_file(Path::new("README.md")));
+    }
+
+    #[test]
+    fn is_markdown_markdown_ext() {
+        assert!(TabState::is_markdown_file(Path::new("doc.markdown")));
+    }
+
+    #[test]
+    fn is_markdown_rs() {
+        assert!(!TabState::is_markdown_file(Path::new("main.rs")));
+    }
+
+    // === detect_run_command ===
+
+    #[test]
+    fn detect_run_command_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("cargo run".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_npm_dev() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("npm run dev".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_docker_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "version: '3'").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("docker compose up".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_go() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module test").unwrap();
+        std::fs::write(dir.path().join("main.go"), "package main").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("go run .".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_run_command(&dir.path().to_path_buf()), None);
+    }
+
+    // === Workspace::derive_abbrev ===
+
+    #[test]
+    fn derive_abbrev_normal() {
+        assert_eq!(Workspace::derive_abbrev("gitterm"), "GI");
+    }
+
+    #[test]
+    fn derive_abbrev_single_char() {
+        assert_eq!(Workspace::derive_abbrev("x"), "X");
+    }
+
+    #[test]
+    fn derive_abbrev_empty() {
+        assert_eq!(Workspace::derive_abbrev(""), "");
+    }
+
+    #[test]
+    fn derive_abbrev_unicode() {
+        assert_eq!(Workspace::derive_abbrev("über"), "ÜB");
+    }
+
+    // === WorkspaceColor ===
+
+    #[test]
+    fn workspace_color_from_index_zero() {
+        assert_eq!(WorkspaceColor::from_index(0), WorkspaceColor::Lavender);
+    }
+
+    #[test]
+    fn workspace_color_from_index_seven() {
+        assert_eq!(WorkspaceColor::from_index(7), WorkspaceColor::Teal);
+    }
+
+    #[test]
+    fn workspace_color_from_index_wraps() {
+        assert_eq!(WorkspaceColor::from_index(8), WorkspaceColor::Lavender);
+    }
+
+    #[test]
+    fn workspace_color_next_available_none_used() {
+        assert_eq!(
+            WorkspaceColor::next_available(&[]),
+            WorkspaceColor::Lavender
+        );
+    }
+
+    #[test]
+    fn workspace_color_next_available_some_used() {
+        assert_eq!(
+            WorkspaceColor::next_available(&[WorkspaceColor::Lavender, WorkspaceColor::Blue]),
+            WorkspaceColor::Green
+        );
+    }
+
+    #[test]
+    fn workspace_color_next_available_all_used() {
+        let all = WorkspaceColor::ALL.to_vec();
+        // When all are used, wraps around
+        let result = WorkspaceColor::next_available(&all);
+        assert_eq!(result, WorkspaceColor::from_index(all.len()));
+    }
+
+    // === AppTheme::toggle ===
+
+    #[test]
+    fn theme_toggle_dark_to_light() {
+        assert_eq!(AppTheme::Dark.toggle(), AppTheme::Light);
+    }
+
+    #[test]
+    fn theme_toggle_light_to_dark() {
+        assert_eq!(AppTheme::Light.toggle(), AppTheme::Dark);
+    }
+
+    // === Additional detect_url edge cases ===
+
+    #[test]
+    fn detect_url_port_zero() {
+        // Port 0 should not match (guard: port > 0)
+        assert_eq!(ConsoleState::detect_url("listening on :0"), None);
+    }
+
+    #[test]
+    fn detect_url_no_digits_after_port() {
+        assert_eq!(ConsoleState::detect_url("listening on :abc"), None);
+    }
+
+    #[test]
+    fn detect_url_http_with_path_and_query() {
+        assert_eq!(
+            ConsoleState::detect_url("http://localhost:3000/api?key=val"),
+            Some("http://localhost:3000/api?key=val".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_quoted_url() {
+        // Double-quote should terminate the URL
+        assert_eq!(
+            ConsoleState::detect_url(r#"Visit "http://localhost:8080/app" now"#),
+            Some("http://localhost:8080/app".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_url_256_color_ansi() {
+        // 256-color ANSI: ESC[38;5;82m
+        assert_eq!(
+            ConsoleState::detect_url("\x1b[38;5;82mhttp://localhost:4000\x1b[0m"),
+            Some("http://localhost:4000".to_string())
+        );
+    }
+
+    // === Additional detect_run_command cases ===
+
+    #[test]
+    fn detect_run_command_npm_start() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("npm start".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_bun_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("bun.lockb"), "").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("bun run dev".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_yarn_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("yarn run dev".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_pnpm_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"nuxt dev"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("pnpm run dev".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_tauri_with_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src-tauri")).unwrap();
+        std::fs::write(
+            dir.path().join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"app\"",
+        )
+        .unwrap();
+        // No package.json — falls back to cargo tauri dev
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("cd src-tauri && cargo tauri dev".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_tauri_with_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src-tauri")).unwrap();
+        std::fs::write(
+            dir.path().join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"app\"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"tauri":"tauri dev"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("npm run tauri".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_go_with_cmd_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module test").unwrap();
+        std::fs::create_dir(dir.path().join("cmd")).unwrap();
+        // cmd/ dir is an alternative to main.go
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("go run .".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_docker_compose_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yaml"), "version: '3'").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("docker compose up".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_run_command_package_json_before_cargo() {
+        // When both package.json and Cargo.toml exist (hybrid project),
+        // package.json takes priority
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(
+            detect_run_command(&dir.path().to_path_buf()),
+            Some("npm run dev".to_string())
+        );
+    }
+
+    // === collect_file_tree ===
+
+    #[test]
+    fn collect_file_tree_sorts_dirs_before_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zebra.txt"), "").unwrap();
+        std::fs::write(dir.path().join("apple.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("beta_dir")).unwrap();
+        std::fs::create_dir(dir.path().join("alpha_dir")).unwrap();
+
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
+        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
+        // Dirs first (sorted), then files (sorted)
+        assert_eq!(
+            names,
+            vec!["alpha_dir", "beta_dir", "apple.txt", "zebra.txt"]
+        );
+    }
+
+    #[test]
+    fn collect_file_tree_hides_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
+        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["visible.txt"]);
+    }
+
+    #[test]
+    fn collect_file_tree_shows_dotfiles_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden"), "").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), true);
+        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".hidden"));
+        assert!(names.contains(&"visible.txt"));
+    }
+
+    #[test]
+    fn collect_file_tree_excludes_node_modules_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
+        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["src"]);
+    }
+
+    #[test]
+    fn collect_file_tree_case_insensitive_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Zebra.txt"), "").unwrap();
+        std::fs::write(dir.path().join("apple.txt"), "").unwrap();
+        std::fs::write(dir.path().join("Banana.txt"), "").unwrap();
+
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
+        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["apple.txt", "Banana.txt", "Zebra.txt"]);
+    }
+
+    #[test]
+    fn collect_file_tree_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
+        assert!(snapshot.entries.is_empty());
+    }
+
+    // === add_word_diffs_to_lines ===
+
+    #[test]
+    fn add_word_diffs_pairs_deletion_and_addition() {
+        let mut lines = vec![
+            DiffLine {
+                content: "old text here".to_string(),
+                line_type: DiffLineType::Deletion,
+                old_line_num: Some(1),
+                new_line_num: None,
+                inline_changes: None,
+            },
+            DiffLine {
+                content: "new text here".to_string(),
+                line_type: DiffLineType::Addition,
+                old_line_num: None,
+                new_line_num: Some(1),
+                inline_changes: None,
+            },
+        ];
+        add_word_diffs_to_lines(&mut lines);
+        // Both lines should have inline_changes populated
+        assert!(lines[0].inline_changes.is_some());
+        assert!(lines[1].inline_changes.is_some());
+        // Deletion line should contain Delete changes
+        let del_changes = lines[0].inline_changes.as_ref().unwrap();
+        assert!(del_changes
+            .iter()
+            .any(|c| c.change_type == ChangeType::Delete));
+        // Addition line should contain Insert changes
+        let add_changes = lines[1].inline_changes.as_ref().unwrap();
+        assert!(add_changes
+            .iter()
+            .any(|c| c.change_type == ChangeType::Insert));
+    }
+
+    #[test]
+    fn add_word_diffs_no_pairs() {
+        // Context lines should not get inline changes
+        let mut lines = vec![DiffLine {
+            content: "context".to_string(),
+            line_type: DiffLineType::Context,
+            old_line_num: Some(1),
+            new_line_num: Some(1),
+            inline_changes: None,
+        }];
+        add_word_diffs_to_lines(&mut lines);
+        assert!(lines[0].inline_changes.is_none());
+    }
+
+    #[test]
+    fn add_word_diffs_completely_different_lines() {
+        // When lines are completely different (no Equal parts), inline_changes
+        // should NOT be set (the function only sets them when there's at least one Equal)
+        let mut lines = vec![
+            DiffLine {
+                content: "aaa".to_string(),
+                line_type: DiffLineType::Deletion,
+                old_line_num: Some(1),
+                new_line_num: None,
+                inline_changes: None,
+            },
+            DiffLine {
+                content: "bbb".to_string(),
+                line_type: DiffLineType::Addition,
+                old_line_num: None,
+                new_line_num: Some(1),
+                inline_changes: None,
+            },
+        ];
+        add_word_diffs_to_lines(&mut lines);
+        assert!(lines[0].inline_changes.is_none());
+        assert!(lines[1].inline_changes.is_none());
+    }
+
+    // === strip_ansi additional edge cases ===
+
+    #[test]
+    fn strip_ansi_bare_escape() {
+        // Lone ESC without [ should skip ESC + next char
+        assert_eq!(ConsoleState::strip_ansi("\x1bXhello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_non_escape_content() {
+        let input = "line1\nline2\ttab";
+        assert_eq!(ConsoleState::strip_ansi(input), input);
     }
 }

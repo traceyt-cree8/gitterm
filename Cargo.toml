@@ -20,8 +20,12 @@ warp = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util"] }
 chrono = "0.4"
 libc = "0.2"
-whisper-rs = "0.15"
-cpal = "0.15"
+whisper-rs = { version = "0.15", optional = true }
+cpal = { version = "0.15", optional = true }
+
+[features]
+default = []
+stt = ["whisper-rs", "cpal"]
 
 [package.metadata.bundle]
 name = "GitTerm"
@@ -32,6 +36,9 @@ short_description = "A Git status viewer with integrated terminal"
 copyright = "Copyright 2025 Cree8"
 category = "Developer Tool"
 osx_minimum_system_version = "13.0"
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 winres = "0.1"

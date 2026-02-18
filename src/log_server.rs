@@ -568,3 +568,54 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === html_escape ===
+
+    #[test]
+    fn html_escape_all_special_chars() {
+        assert_eq!(
+            html_escape(r#"<div class="a" data='b'>&</div>"#),
+            "&lt;div class=&quot;a&quot; data=&#39;b&#39;&gt;&amp;&lt;/div&gt;"
+        );
+    }
+
+    #[test]
+    fn html_escape_no_special_chars() {
+        assert_eq!(html_escape("hello world 123"), "hello world 123");
+    }
+
+    #[test]
+    fn html_escape_empty() {
+        assert_eq!(html_escape(""), "");
+    }
+
+    // === add_line_numbers ===
+
+    #[test]
+    fn add_line_numbers_single_line() {
+        let result = add_line_numbers("hello");
+        assert!(result.contains("1"));
+        assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn add_line_numbers_multi_line() {
+        let result = add_line_numbers("line1\nline2\nline3");
+        assert!(result.contains("1"));
+        assert!(result.contains("2"));
+        assert!(result.contains("3"));
+        assert!(result.contains("line1"));
+        assert!(result.contains("line3"));
+    }
+
+    #[test]
+    fn add_line_numbers_empty() {
+        let result = add_line_numbers("");
+        // Empty string produces no lines from .lines(), so result is empty
+        assert_eq!(result, "");
+    }
+}

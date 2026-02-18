@@ -30,8 +30,13 @@ jobs:
         key: windows-x86_64
         cache-on-failure: true
 
+    - name: Install LLVM (for whisper-rs)
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        version: "17"
+
     - name: Build
-      run: cargo build --release --verbose
+      run: cargo build --release --features stt --verbose
       env:
         RUST_BACKTRACE: 1
 

@@ -373,4 +373,41 @@ mod tests {
         let (_, has_mermaid) = process_mermaid_blocks(content);
         assert!(!has_mermaid);
     }
+
+    #[test]
+    fn test_mermaid_html_output() {
+        let content = "# Test\n\n```mermaid\ngraph TD\nA --> B\n```\n";
+        let (processed, _) = process_mermaid_blocks(content);
+        assert!(processed.contains("<pre class=\"mermaid\">"));
+        assert!(processed.contains("graph TD"));
+        assert!(processed.contains("A --> B"));
+    }
+
+    #[test]
+    fn test_render_dark_theme() {
+        let html = render_markdown_to_html("# Hello", true);
+        // Dark theme uses Catppuccin Mocha bg
+        assert!(html.contains("#1e1e2e"));
+    }
+
+    #[test]
+    fn test_render_light_theme() {
+        let html = render_markdown_to_html("# Hello", false);
+        // Light theme uses Catppuccin Latte bg
+        assert!(html.contains("#eff1f5"));
+    }
+
+    #[test]
+    fn test_theme_colors_dark() {
+        let dark = ThemeColors::dark();
+        assert_eq!(dark.bg_base, "#1e1e2e");
+        assert_eq!(dark.accent, "#89b4fa");
+    }
+
+    #[test]
+    fn test_theme_colors_light() {
+        let light = ThemeColors::light();
+        assert_eq!(light.bg_base, "#eff1f5");
+        assert_eq!(light.accent, "#1e66f5");
+    }
 }
