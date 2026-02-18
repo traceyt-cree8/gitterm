@@ -11,7 +11,7 @@ use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -568,9 +568,7 @@ fn stt_model_path() -> PathBuf {
         .join("ggml-base.en.bin")
 }
 
-fn stt_start_recording(
-    audio_buffer: Arc<Mutex<Vec<f32>>>,
-) -> Result<(cpal::Stream, u32), String> {
+fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -613,26 +611,24 @@ fn stt_start_recording(
                 None,
             )
             .map_err(|e| format!("Failed to build input stream: {}", e))?,
-        cpal::SampleFormat::I16 => {
-            device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mut buf = buf.lock().unwrap();
-                        if channels == 1 {
-                            buf.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                        } else {
-                            for chunk in data.chunks(channels) {
-                                let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
-                                buf.push(sum / channels as f32);
-                            }
+        cpal::SampleFormat::I16 => device
+            .build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mut buf = buf.lock().unwrap();
+                    if channels == 1 {
+                        buf.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
+                            buf.push(sum / channels as f32);
                         }
-                    },
-                    |err| eprintln!("[STT] Audio stream error: {}", err),
-                    None,
-                )
-                .map_err(|e| format!("Failed to build input stream: {}", e))?
-        }
+                    }
+                },
+                |err| eprintln!("[STT] Audio stream error: {}", err),
+                None,
+            )
+            .map_err(|e| format!("Failed to build input stream: {}", e))?,
         format => return Err(format!("Unsupported sample format: {:?}", format)),
     };
 
@@ -650,7 +646,6 @@ fn stt_transcribe(
 ) -> Result<String, String> {
     let input_rate = input_sample_rate as usize;
     let output_rate = 16000usize;
-
 
     // Resample to 16kHz for Whisper using linear interpolation
     let resampled = if input_rate != output_rate {
@@ -675,7 +670,8 @@ fn stt_transcribe(
         .create_state()
         .map_err(|e| format!("Failed to create whisper state: {}", e))?;
 
-    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+    let mut params =
+        whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("en"));
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -759,7 +755,7 @@ struct ClaudeConfigItem {
 }
 
 // Claude sidebar config tree
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ClaudeConfig {
     skills: Vec<ClaudeConfigItem>,
     plugins: Vec<ClaudeConfigItem>,
@@ -770,19 +766,6 @@ struct ClaudeConfig {
     selected_item: Option<(String, usize)>,
 }
 
-impl Default for ClaudeConfig {
-    fn default() -> Self {
-        Self {
-            skills: Vec::new(),
-            plugins: Vec::new(),
-            mcp_servers: Vec::new(),
-            hooks: Vec::new(),
-            settings: Vec::new(),
-            expanded: HashSet::new(),
-            selected_item: None,
-        }
-    }
-}
 
 // Inline change for word-level diffs
 #[derive(Debug, Clone)]
@@ -1045,7 +1028,7 @@ impl ConsoleState {
         self.status == ConsoleStatus::Running
     }
 
-    fn spawn_process(&mut self, dir: &PathBuf) {
+    fn spawn_process(&mut self, dir: &Path) {
         let cmd_str = match &self.run_command {
             Some(cmd) => cmd.clone(),
             None => return,
@@ -1062,7 +1045,7 @@ impl ConsoleState {
         self.started_at = Some(std::time::Instant::now());
         self.stopped_at = None;
 
-        let dir = dir.clone();
+        let dir = dir.to_path_buf();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1229,10 +1212,10 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
     }
 
     // 5. Go project
-    if dir.join("go.mod").exists() {
-        if dir.join("main.go").exists() || dir.join("cmd").is_dir() {
-            return Some("go run .".to_string());
-        }
+    if dir.join("go.mod").exists()
+        && (dir.join("main.go").exists() || dir.join("cmd").is_dir())
+    {
+        return Some("go run .".to_string());
     }
 
     None
@@ -1320,10 +1303,10 @@ impl TabState {
         }
     }
 
-    fn is_image_file(path: &PathBuf) -> bool {
+    fn is_image_file(path: &Path) -> bool {
         path.extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| {
+            .and_then(|e: &std::ffi::OsStr| e.to_str())
+            .map(|ext: &str| {
                 matches!(
                     ext.to_lowercase().as_str(),
                     "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
@@ -1332,10 +1315,10 @@ impl TabState {
             .unwrap_or(false)
     }
 
-    fn is_markdown_file(path: &PathBuf) -> bool {
+    fn is_markdown_file(path: &Path) -> bool {
         path.extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| matches!(ext.to_lowercase().as_str(), "md" | "markdown"))
+            .and_then(|e: &std::ffi::OsStr| e.to_str())
+            .map(|ext: &str| matches!(ext.to_lowercase().as_str(), "md" | "markdown"))
             .unwrap_or(false)
     }
 
@@ -1351,8 +1334,8 @@ impl TabState {
         // Helper to expand ~ and check if path exists
         let try_path = |s: &str| -> Option<PathBuf> {
             let s = s.trim();
-            let expanded = if s.starts_with("~/") {
-                format!("{}/{}", home, &s[2..])
+            let expanded = if let Some(rest) = s.strip_prefix("~/") {
+                format!("{}/{}", home, rest)
             } else if s == "~" {
                 home.clone()
             } else if s.starts_with('/') {
@@ -2651,7 +2634,7 @@ impl App {
         let active_tab = self.active_workspace().map(|ws| ws.active_tab).unwrap_or(0);
         let target_x = (active_tab as f32 * ESTIMATED_TAB_WIDTH).max(0.0);
         iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
-            tab_scrollable_id().into(),
+            tab_scrollable_id(),
             scrollable::AbsoluteOffset {
                 x: Some(target_x),
                 y: None,
@@ -2662,7 +2645,7 @@ impl App {
     fn scroll_to_active_workspace_bar(&self) -> Task<Event> {
         let target_x = (self.active_workspace_idx as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
         iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
-            workspace_bar_scrollable_id().into(),
+            workspace_bar_scrollable_id(),
             scrollable::AbsoluteOffset {
                 x: Some(target_x),
                 y: None,
@@ -2898,7 +2881,7 @@ impl App {
                 let dir = PathBuf::from(&ws_config.dir);
                 let home = std::env::var("HOME").unwrap_or_default();
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
-                let name = if dir == PathBuf::from(&home) {
+                let name = if dir == Path::new(&home) {
                     ws_config
                         .tabs
                         .first()
@@ -3112,7 +3095,6 @@ fi
                 working_directory: Some(cwd.to_path_buf()),
                 scrollback_lines,
                 env,
-                ..Default::default()
             },
             theme: iced_term::settings::ThemeSettings::new(Box::new(theme.terminal_palette())),
             font: iced_term::settings::FontSettings {
@@ -3497,16 +3479,11 @@ fi
                 for ws in &mut self.workspaces {
                     // Take rx out to avoid double-borrow
                     if let Some(mut rx) = ws.console.output_rx.take() {
-                        let mut count = 0;
                         let mut exited_info = None;
                         let mut messages = Vec::new();
-                        loop {
-                            match rx.try_recv() {
-                                Ok(msg) => messages.push(msg),
-                                Err(_) => break,
-                            }
-                            count += 1;
-                            if count >= 50 {
+                        while let Ok(msg) = rx.try_recv() {
+                            messages.push(msg);
+                            if messages.len() >= 50 {
                                 break;
                             }
                         }
@@ -3939,22 +3916,22 @@ fi
                             Key::Named(key::Named::Escape) => {
                                 return Task::done(Event::ClearSelection);
                             }
-                            Key::Character(c) if c == "j" => {
+                            Key::Character("j") => {
                                 let new_idx = tab.file_index + 1;
                                 return Task::done(Event::FileSelectByIndex(new_idx));
                             }
-                            Key::Character(c) if c == "k" => {
+                            Key::Character("k") => {
                                 let new_idx = tab.file_index - 1;
                                 return Task::done(Event::FileSelectByIndex(new_idx));
                             }
-                            Key::Character(c) if c == "g" => {
+                            Key::Character("g") => {
                                 return Task::done(Event::FileSelectByIndex(0));
                             }
-                            Key::Character(c) if c == "G" => {
+                            Key::Character("G") => {
                                 let last = (tab.total_changes() as i32) - 1;
                                 return Task::done(Event::FileSelectByIndex(last));
                             }
-                            Key::Character(c) if c == "e" => {
+                            Key::Character("e") => {
                                 // Open selected file in $EDITOR
                                 let full_path =
                                     tab.repo_path.join(tab.selected_file.as_ref().unwrap());
@@ -3966,7 +3943,11 @@ fi
                 }
 
                 // Ctrl+Space — toggle speech-to-text recording
-                if modifiers.control() && !modifiers.command() && !modifiers.shift() && !modifiers.alt() {
+                if modifiers.control()
+                    && !modifiers.command()
+                    && !modifiers.shift()
+                    && !modifiers.alt()
+                {
                     if let Key::Named(key::Named::Space) = key.as_ref() {
                         return Task::done(Event::SttToggle);
                     }
@@ -3998,7 +3979,7 @@ fi
                 if modifiers.control() && !modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
                         if let Ok(num) = c.parse::<usize>() {
-                            if num >= 1 && num <= 9 && num <= self.workspaces.len() {
+                            if (1..=9).contains(&num) && num <= self.workspaces.len() {
                                 return Task::done(Event::WorkspaceSelect(num - 1));
                             }
                         }
@@ -4024,7 +4005,7 @@ fi
                         } else if let Ok(num) = c.parse::<usize>() {
                             let tab_count =
                                 self.active_workspace().map(|ws| ws.tabs.len()).unwrap_or(0);
-                            if num >= 1 && num <= 9 && num <= tab_count {
+                            if (1..=9).contains(&num) && num <= tab_count {
                                 return Task::done(Event::TabSelect(num - 1));
                             }
                         }
@@ -4221,7 +4202,7 @@ fi
                     let has_left = self.active_workspace_idx > 0;
                     let has_right = self.active_workspace_idx + 1 < self.workspaces.len();
 
-                    let near_left = has_left && content_x >= 0.0 && content_x < EDGE_PEEK_ZONE;
+                    let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
                     let near_right = has_right
                         && content_x > content_width - EDGE_PEEK_ZONE
                         && content_x <= content_width;
@@ -4487,7 +4468,7 @@ fi
 
                 let scroll_task = iced::advanced::widget::operate(
                     iced::advanced::widget::operation::scrollable::scroll_to(
-                        workspace_scrollable_id().into(),
+                        workspace_scrollable_id(),
                         scrollable::AbsoluteOffset {
                             x: Some(new_target),
                             y: None,
@@ -4629,9 +4610,11 @@ fi
                     let sample_rate = self.stt_sample_rate;
                     return Task::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || stt_transcribe(ctx, samples, sample_rate))
-                                .await
-                                .unwrap_or_else(|e| Err(format!("Join error: {}", e)))
+                            tokio::task::spawn_blocking(move || {
+                                stt_transcribe(ctx, samples, sample_rate)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Join error: {}", e)))
                         },
                         |result| match result {
                             Ok(text) => Event::SttTranscriptReady(text),
@@ -4696,7 +4679,7 @@ fi
                     // Set scrollable to starting position for the animation
                     let slide_task = iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
-                            workspace_scrollable_id().into(),
+                            workspace_scrollable_id(),
                             scrollable::AbsoluteOffset {
                                 x: Some(self.slide_start_offset),
                                 y: None,
@@ -4743,7 +4726,7 @@ fi
                     let offset_x = self.slide_offset;
                     return iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
-                            workspace_scrollable_id().into(),
+                            workspace_scrollable_id(),
                             scrollable::AbsoluteOffset {
                                 x: Some(offset_x),
                                 y: None,
@@ -4806,7 +4789,7 @@ fi
 
                     return iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
-                            workspace_scrollable_id().into(),
+                            workspace_scrollable_id(),
                             scrollable::AbsoluteOffset {
                                 x: Some(new_target),
                                 y: None,
@@ -5894,11 +5877,11 @@ fi
                 } else {
                     theme.peach()
                 };
-                ("\u{25CF} REC", c)  // ● REC
+                ("\u{25CF} REC", c) // ● REC
             } else if self.stt_transcribing {
-                ("\u{2026}", theme.warning())  // … (processing)
+                ("\u{2026}", theme.warning()) // … (processing)
             } else {
-                ("\u{25CB}", theme.overlay0())  // ○ grey idle
+                ("\u{25CB}", theme.overlay0()) // ○ grey idle
             };
             metadata_row = metadata_row.push(
                 text(mic_icon)
@@ -7407,7 +7390,7 @@ fi
                         })
                         .into()
                 } else {
-                    self.parse_inline_markdown(cell, font_small).into()
+                    self.parse_inline_markdown(cell, font_small)
                 };
 
                 let cell_bg = if is_header {
@@ -8282,7 +8265,7 @@ fi
             button::Style {
                 background: Some(bg.into()),
                 border: iced::Border {
-                    width: if console_is_active { 0.0 } else { 0.0 },
+                    width: 0.0,
                     color: iced::Color::TRANSPARENT,
                     radius: 3.0.into(),
                 },

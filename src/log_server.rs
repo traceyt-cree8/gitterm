@@ -167,13 +167,14 @@ async fn handle_index(state: ServerState) -> Result<impl warp::Reply, warp::Reje
     tabs.sort_by_key(|t| t.tab_id);
 
     for snapshot in tabs {
+        let safe_tab_name = html_escape(&snapshot.tab_name);
         html.push_str(&format!(
             r#"        <li class="tab-item">
             <a href="/tab/{}">{}</a>
             <span class="tab-id">Tab #{}</span>
         </li>
 "#,
-            snapshot.tab_id, snapshot.tab_name, snapshot.tab_id
+            snapshot.tab_id, safe_tab_name, snapshot.tab_id
         ));
     }
 
@@ -194,6 +195,7 @@ async fn handle_tab(
     let snapshots = state.terminals.read().await;
 
     if let Some(snapshot) = snapshots.get(&tab_id) {
+        let safe_tab_name = html_escape(&snapshot.tab_name);
         let html = format!(
             r#"<!DOCTYPE html>
 <html>
@@ -345,8 +347,8 @@ async fn handle_tab(
     <pre id="terminal-content">{}</pre>
 </body>
 </html>"#,
-            snapshot.tab_name,
-            snapshot.tab_name,
+            safe_tab_name,
+            safe_tab_name,
             tab_id,
             html_escape(&snapshot.content)
         );
@@ -395,6 +397,7 @@ async fn handle_file(
     let files = state.files.read().await;
 
     if let Some(file_snapshot) = files.get(&tab_id) {
+        let safe_file_path = html_escape(&file_snapshot.file_path);
         let html = format!(
             r#"<!DOCTYPE html>
 <html>
@@ -495,8 +498,8 @@ async fn handle_file(
     <pre id="file-content">{}</pre>
 </body>
 </html>"#,
-            file_snapshot.file_path,
-            file_snapshot.file_path,
+            safe_file_path,
+            safe_file_path,
             add_line_numbers(&html_escape(&file_snapshot.content))
         );
 

@@ -4,12 +4,14 @@
 // the WebView must be created and managed on the main thread.
 
 use std::cell::RefCell;
+
+type WebViewBounds = (f32, f32, f32, f32);
 use wry::raw_window_handle::{HasWindowHandle, WindowHandle};
 use wry::{Rect, WebView, WebViewBuilder};
 
 thread_local! {
     static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
-    static PENDING_HTML: RefCell<Option<(String, (f32, f32, f32, f32))>> = const { RefCell::new(None) };
+    static PENDING_HTML: RefCell<Option<(String, WebViewBounds)>> = const { RefCell::new(None) };
 }
 
 /// Wrapper that holds a raw window handle and implements HasWindowHandle
