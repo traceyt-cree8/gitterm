@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Excalidraw Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+  /* Hide all Excalidraw UI chrome in view mode */
+  .excalidraw .layer-ui__wrapper__top-right,
+  .excalidraw .layer-ui__wrapper__footer,
+  .excalidraw .layer-ui__wrapper .zen-mode-transition,
+  .excalidraw .App-menu,
+  .excalidraw .HintViewer,
+  .excalidraw .main-menu-trigger,
+  .excalidraw .undo-redo-buttons,
+  .excalidraw .Island,
+  .excalidraw .App-toolbar-container,
+  .excalidraw .shapes-section { display: none !important; }
+  .excalidraw .layer-ui__wrapper { padding: 0 !important; }
+  .excalidraw { --ui-padding: 0 !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script id="excalidraw-data" type="application/json">{{EXCALIDRAW_DATA}}</script>
+<script type="module">
+import React from "https://esm.sh/react@18.3.1";
+import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+import * as ExcalidrawLib from "https://esm.sh/@excalidraw/excalidraw@0.17.6?deps=react@18.3.1,react-dom@18.3.1";
+const Excalidraw = ExcalidrawLib.Excalidraw || ExcalidrawLib.default?.Excalidraw;
+
+const sceneData = JSON.parse(document.getElementById("excalidraw-data").textContent);
+const theme = "{{THEME}}";
+try {
+  // Prevent persisted Excalidraw viewport state from overriding initialData.
+  Object.keys(localStorage).forEach(function(key) {
+    if (key.toLowerCase().indexOf("excalidraw") !== -1) {
+      localStorage.removeItem(key);
+    }
+  });
+} catch (_) {}
+
+function visibleElements(elements) {
+  return (elements || []).filter(function(el) { return !el.isDeleted; });
+}
+
+function computeBounds(elements) {
+  var visible = visibleElements(elements);
+  if (visible.length === 0) return null;
+
+  var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (var i = 0; i < visible.length; i++) {
+    var el = visible[i];
+    var x1 = el.x, y1 = el.y;
+    var x2 = x1 + (el.width || 0), y2 = y1 + (el.height || 0);
+    if (x1 < minX) minX = x1;
+    if (y1 < minY) minY = y1;
+    if (x2 > maxX) maxX = x2;
+    if (y2 > maxY) maxY = y2;
+  }
+
+  return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+}
+
+function normalizeElementsToTopLeft(elements, pad) {
+  var bounds = computeBounds(elements);
+  if (!bounds) return elements || [];
+
+  var dx = pad - bounds.minX;
+  var dy = pad - bounds.minY;
+  if (dx === 0 && dy === 0) return elements || [];
+
+  return (elements || []).map(function(el) {
+    // Only x/y need shifting; element internals (e.g. points) are relative.
+    return Object.assign({}, el, { x: (el.x || 0) + dx, y: (el.y || 0) + dy });
+  });
+}
+
+var normalizedElements = normalizeElementsToTopLeft(sceneData.elements || [], 24);
+function computeFitView(elements, viewWidth, viewHeight) {
+  var bounds = computeBounds(elements);
+  if (!bounds) return { scrollX: 0, scrollY: 0, zoom: { value: 1 } };
+
+  var minX = bounds.minX, minY = bounds.minY;
+  var contentW = Math.max(bounds.maxX - bounds.minX, 1);
+  var contentH = Math.max(bounds.maxY - bounds.minY, 1);
+  var pad = 32;
+  var zoomX = (viewWidth - pad * 2) / contentW;
+  var zoomY = (viewHeight - pad * 2) / contentH;
+  var zoom = Math.min(zoomX, zoomY, 2);
+  zoom = Math.max(0.1, zoom);
+
+  // X centered, Y biased to top padding.
+  var scrollX = (viewWidth / zoom - contentW) / 2 - minX;
+  var scrollY = (pad / zoom) - minY;
+  return { scrollX: scrollX, scrollY: scrollY, zoom: { value: zoom } };
+}
+
+var vw = window.innerWidth || 800;
+var vh = window.innerHeight || 600;
+var fit = computeFitView(normalizedElements, vw, vh);
+var baseAppState = sceneData.appState || {};
+
+function App() {
+  var excalidrawRef = React.useRef(null);
+
+  React.useEffect(function() {
+    if (!excalidrawRef.current) return;
+    // Force viewport after mount so scene starts near the top.
+    excalidrawRef.current.updateScene({
+      appState: {
+        scrollX: fit.scrollX,
+        scrollY: fit.scrollY,
+        zoom: fit.zoom,
+      },
+    });
+  }, []);
+
+  return React.createElement(
+    "div",
+    { style: { width: "100vw", height: "100vh" } },
+    React.createElement(Excalidraw, {
+      excalidrawAPI: function(api) { excalidrawRef.current = api; },
+      initialData: {
+        elements: normalizedElements,
+        appState: Object.assign({}, baseAppState, {
+          viewModeEnabled: true,
+          theme: theme,
+          zenModeEnabled: true,
+          scrollX: fit.scrollX,
+          scrollY: fit.scrollY,
+          zoom: fit.zoom,
+        }),
+        files: sceneData.files || {},
+      },
+      viewModeEnabled: true,
+      zenModeEnabled: true,
+      theme: theme,
+      UIOptions: {
+        canvasActions: {
+          changeViewBackgroundColor: false,
+          clearCanvas: false,
+          export: false,
+          loadScene: false,
+          saveToActiveFile: false,
+          toggleTheme: false,
+        },
+        tools: { image: false },
+      },
+      renderTopRightUI: function() { return null; },
+    })
+  );
+}
+
+const root = createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>

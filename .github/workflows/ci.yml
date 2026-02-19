@@ -42,5 +42,11 @@ jobs:
     - name: Clippy
       run: cargo clippy -- -D warnings
 
+    - name: Clippy (excalidraw)
+      run: cargo clippy --features excalidraw -- -D warnings
+
     - name: Tests
       run: cargo test
+
+    - name: Tests (excalidraw)
+      run: cargo test --features excalidraw

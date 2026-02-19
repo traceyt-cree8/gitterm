@@ -17,6 +17,8 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "excalidraw")]
+mod excalidraw;
 mod log_server;
 mod markdown;
 mod webview;
@@ -290,6 +292,8 @@ struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceTabConfig {
     dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_command: Option<String>,
 }
@@ -1255,7 +1259,7 @@ struct TabState {
     file_tree: Vec<FileTreeEntry>,
     // File viewer state
     viewing_file_path: Option<PathBuf>,
-    file_content: Vec<String>,
+    file_content: String,
     image_handle: Option<image::Handle>,
     // Markdown WebView content (rendered HTML)
     webview_content: Option<String>,
@@ -1277,7 +1281,7 @@ impl TabState {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
         let current_dir = repo_path.clone();
-        let is_git_repo = Repository::open(&repo_path).is_ok();
+        let is_git_repo = Repository::discover(&repo_path).is_ok();
 
         Self {
             id,
@@ -1299,7 +1303,7 @@ impl TabState {
             current_dir,
             file_tree: Vec::new(),
             viewing_file_path: None,
-            file_content: Vec::new(),
+            file_content: String::new(),
             image_handle: None,
             webview_content: None,
             search: SearchState::default(),
@@ -1326,6 +1330,13 @@ impl TabState {
         path.extension()
             .and_then(|e: &std::ffi::OsStr| e.to_str())
             .map(|ext: &str| matches!(ext.to_lowercase().as_str(), "md" | "markdown"))
+            .unwrap_or(false)
+    }
+
+    fn is_html_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e: &std::ffi::OsStr| e.to_str())
+            .map(|ext: &str| matches!(ext.to_lowercase().as_str(), "html" | "htm"))
             .unwrap_or(false)
     }
 
@@ -1439,20 +1450,33 @@ impl TabState {
         self.webview_content = None;
         self.viewing_file_path = Some(path.clone());
 
+        #[cfg(feature = "excalidraw")]
+        if excalidraw::is_excalidraw_file(path) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if excalidraw::validate_excalidraw(&content) {
+                    let html = excalidraw::render_excalidraw_html(&content, is_dark_theme);
+                    self.webview_content = Some(html);
+                }
+            }
+            return;
+        }
+
         if Self::is_markdown_file(path) {
             // Load as markdown - render to HTML and store for potential browser viewing
             if let Ok(content) = std::fs::read_to_string(path) {
                 let html = markdown::render_markdown_to_html(&content, is_dark_theme);
                 self.webview_content = Some(html);
-                // Also store raw content for Iced-based rendering
-                self.file_content = content.lines().map(|s| s.to_string()).collect();
+            }
+        } else if Self::is_html_file(path) {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                self.webview_content = Some(content);
             }
         } else if Self::is_image_file(path) {
             // Load as image
             self.image_handle = Some(image::Handle::from_path(path));
         } else if let Ok(content) = std::fs::read_to_string(path) {
             // Load as text
-            self.file_content = content.lines().map(|s| s.to_string()).collect();
+            self.file_content = content;
         }
     }
 
@@ -2071,7 +2095,7 @@ fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
         untracked: Vec::new(),
     };
 
-    if let Ok(repo) = Repository::open(&repo_path) {
+    if let Ok(repo) = Repository::open(&repo_path).or_else(|_| Repository::discover(&repo_path)) {
         snapshot.is_git_repo = true;
         if let Ok(head) = repo.head() {
             if let Some(name) = head.shorthand() {
@@ -2350,21 +2374,35 @@ fn collect_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> FileL
     let mut snapshot = FileLoadSnapshot {
         tab_id,
         path: path.clone(),
-        file_content: Vec::new(),
+        file_content: String::new(),
         image_path: None,
         webview_content: None,
     };
+
+    #[cfg(feature = "excalidraw")]
+    if excalidraw::is_excalidraw_file(&path) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if excalidraw::validate_excalidraw(&content) {
+                snapshot.webview_content =
+                    Some(excalidraw::render_excalidraw_html(&content, is_dark_theme));
+            }
+        }
+        return snapshot;
+    }
 
     if TabState::is_markdown_file(&path) {
         if let Ok(content) = std::fs::read_to_string(&path) {
             snapshot.webview_content =
                 Some(markdown::render_markdown_to_html(&content, is_dark_theme));
-            snapshot.file_content = content.lines().map(|s| s.to_string()).collect();
+        }
+    } else if TabState::is_html_file(&path) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            snapshot.webview_content = Some(content);
         }
     } else if TabState::is_image_file(&path) {
         snapshot.image_path = Some(path);
     } else if let Ok(content) = std::fs::read_to_string(&path) {
-        snapshot.file_content = content.lines().map(|s| s.to_string()).collect();
+        snapshot.file_content = content;
     }
 
     snapshot
@@ -2605,7 +2643,7 @@ pub struct DiffSnapshot {
 pub struct FileLoadSnapshot {
     tab_id: usize,
     path: PathBuf,
-    file_content: Vec<String>,
+    file_content: String,
     image_path: Option<PathBuf>,
     webview_content: Option<String>,
 }
@@ -2619,6 +2657,41 @@ impl App {
     /// Small UI font size (for hints, secondary text)
     fn ui_font_small(&self) -> f32 {
         self.ui_font_size - 1.0
+    }
+
+    fn tab_uses_inline_webview(tab: &TabState) -> bool {
+        let is_markdown_webview = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| TabState::is_markdown_file(p))
+            .unwrap_or(false)
+            && tab.webview_content.is_some();
+        let is_html = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| TabState::is_html_file(p))
+            .unwrap_or(false);
+
+        #[cfg(feature = "excalidraw")]
+        let is_excalidraw = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| excalidraw::is_excalidraw_file(p))
+            .unwrap_or(false);
+        #[cfg(not(feature = "excalidraw"))]
+        let is_excalidraw = false;
+
+        is_excalidraw || is_markdown_webview || is_html
+    }
+
+    fn active_inline_webview_html(&self) -> Option<String> {
+        self.active_tab().and_then(|tab| {
+            if Self::tab_uses_inline_webview(tab) {
+                tab.webview_content.clone()
+            } else {
+                None
+            }
+        })
     }
 
     /// Focus the active main tab terminal (unfocusing bottom panel terminal)
@@ -2707,6 +2780,7 @@ impl App {
                         .iter()
                         .map(|tab| WorkspaceTabConfig {
                             dir: tab.current_dir.to_string_lossy().to_string(),
+                            repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
                             startup_command: tab.startup_command.clone(),
                         })
                         .collect(),
@@ -2741,6 +2815,14 @@ impl App {
             return Task::none();
         }
 
+        // If the localhost log server is unavailable, skip expensive snapshot collection.
+        if self.log_server_state.base_url().is_none() {
+            self.log_server_dirty = false;
+            self.next_log_server_sync_at =
+                Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
+            return Task::none();
+        }
+
         self.log_server_dirty = false;
         self.log_server_sync_in_flight = true;
         self.next_log_server_sync_at =
@@ -2765,10 +2847,9 @@ impl App {
             // If tab is viewing a file, add it to file snapshots
             if let Some(file_path) = &tab.viewing_file_path {
                 if !tab.file_content.is_empty() {
-                    let content = tab.file_content.join("\n");
                     let snapshot = log_server::FileSnapshot {
                         file_path: file_path.to_string_lossy().to_string(),
-                        content,
+                        content: tab.file_content.clone(),
                     };
                     file_snapshots.insert(tab.id, snapshot);
                 }
@@ -2787,15 +2868,45 @@ impl App {
     }
 
     fn request_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        let fallback_repo_path = repo_path.clone();
         Task::perform(
-            async move { collect_git_status(tab_id, repo_path) },
+            async move {
+                match tokio::task::spawn_blocking(move || collect_git_status(tab_id, repo_path))
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        eprintln!(
+                            "[git-status] spawn_blocking failed for tab {} ({}): {}",
+                            tab_id,
+                            fallback_repo_path.display(),
+                            err
+                        );
+                        collect_git_status(tab_id, fallback_repo_path)
+                    }
+                }
+            },
             Event::GitStatusLoaded,
         )
     }
 
     fn request_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> Task<Event> {
+        let fallback_dir = current_dir.clone();
         Task::perform(
-            async move { collect_file_tree(tab_id, current_dir, show_hidden) },
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    collect_file_tree(tab_id, current_dir, show_hidden)
+                })
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => FileTreeSnapshot {
+                        tab_id,
+                        current_dir: fallback_dir,
+                        entries: Vec::new(),
+                    },
+                }
+            },
             Event::FileTreeLoaded,
         )
     }
@@ -2806,15 +2917,46 @@ impl App {
         file_path: String,
         staged: bool,
     ) -> Task<Event> {
+        let fallback_file_path = file_path.clone();
         Task::perform(
-            async move { collect_diff(tab_id, repo_path, file_path, staged) },
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    collect_diff(tab_id, repo_path, file_path, staged)
+                })
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => DiffSnapshot {
+                        tab_id,
+                        file_path: fallback_file_path,
+                        is_staged: staged,
+                        lines: Vec::new(),
+                    },
+                }
+            },
             Event::DiffLoaded,
         )
     }
 
     fn request_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> Task<Event> {
+        let fallback_path = path.clone();
         Task::perform(
-            async move { collect_file_load(tab_id, path, is_dark_theme) },
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    collect_file_load(tab_id, path, is_dark_theme)
+                })
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => FileLoadSnapshot {
+                        tab_id,
+                        path: fallback_path,
+                        file_content: String::new(),
+                        image_path: None,
+                        webview_content: None,
+                    },
+                }
+            },
             Event::FileLoaded,
         )
     }
@@ -2931,9 +3073,25 @@ impl App {
                 } else {
                     for tab_config in &ws_config.tabs {
                         let tab_dir = PathBuf::from(&tab_config.dir);
+                        let repo_dir = tab_config
+                            .repo_dir
+                            .as_ref()
+                            .map(PathBuf::from)
+                            .or_else(|| {
+                                Repository::discover(&tab_dir)
+                                    .ok()
+                                    .and_then(|repo| repo.workdir().map(PathBuf::from))
+                            })
+                            .unwrap_or_else(|| tab_dir.clone());
+                        let current_dir = if tab_dir.is_dir() {
+                            tab_dir
+                        } else {
+                            repo_dir.clone()
+                        };
                         app.add_tab_to_workspace_with_command(
                             &mut workspace,
-                            tab_dir,
+                            repo_dir,
+                            Some(current_dir),
                             tab_config.startup_command.clone(),
                         );
                     }
@@ -2984,9 +3142,15 @@ impl App {
         &mut self,
         workspace: &mut Workspace,
         repo_path: PathBuf,
+        current_dir: Option<PathBuf>,
         startup_command: Option<String>,
     ) {
-        let tab = self.create_tab(repo_path, startup_command);
+        let mut tab = self.create_tab(repo_path.clone(), startup_command);
+        if let Some(dir) = current_dir {
+            tab.current_dir = dir;
+        } else {
+            tab.current_dir = repo_path;
+        }
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
     }
@@ -3446,9 +3610,26 @@ fi
             }
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
+                let mut workspace_dirty = false;
 
                 // Poll git status every 5 seconds for the active tab (off UI thread)
                 if let Some(tab) = self.active_tab_mut() {
+                    // Self-heal repo root for restored sessions that may have persisted a subdir.
+                    if let Ok(repo) = Repository::discover(&tab.current_dir) {
+                        if let Some(repo_root) = repo.workdir() {
+                            let corrected = repo_root.to_path_buf();
+                            if corrected != tab.repo_path {
+                                tab.repo_path = corrected;
+                                tab.repo_name = tab
+                                    .repo_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "repo".to_string());
+                                workspace_dirty = true;
+                            }
+                        }
+                    }
+
                     if tab.last_poll.elapsed() >= Duration::from_millis(5000) {
                         let tab_id = tab.id;
                         let repo_path = tab.repo_path.clone();
@@ -3456,17 +3637,22 @@ fi
                         tasks.push(Self::request_git_status(tab_id, repo_path));
                     }
                 }
+                if workspace_dirty {
+                    self.mark_workspaces_dirty();
+                }
 
                 // Debounced workspace persistence
                 let now = Instant::now();
-                // Terminals can change independently; keep server snapshots fresh on interval.
-                self.log_server_dirty = true;
+                // Keep log snapshots fresh on interval only when the local server is active.
+                if self.log_server_state.base_url().is_some() {
+                    self.log_server_dirty = true;
+                }
                 if self.workspaces_dirty
                     && self
                         .next_workspace_save_at
                         .is_some_and(|deadline| now >= deadline)
                 {
-                    self.mark_workspaces_dirty();
+                    self.save_workspaces();
                     self.workspaces_dirty = false;
                     self.next_workspace_save_at = None;
                 }
@@ -3506,6 +3692,7 @@ fi
 
                 // Drain console output for all workspaces
                 let mut auto_expand = false;
+                let mut console_changed = false;
                 for ws in &mut self.workspaces {
                     // Take rx out to avoid double-borrow
                     if let Some(mut rx) = ws.console.output_rx.take() {
@@ -3521,12 +3708,15 @@ fi
                             match msg {
                                 ConsoleOutputMessage::Stdout(line) => {
                                     ws.console.push_line(line, false);
+                                    console_changed = true;
                                 }
                                 ConsoleOutputMessage::Stderr(line) => {
                                     ws.console.push_line(line, true);
+                                    console_changed = true;
                                 }
                                 ConsoleOutputMessage::Exited(code) => {
                                     exited_info = Some(code);
+                                    console_changed = true;
                                 }
                             }
                         }
@@ -3552,16 +3742,23 @@ fi
                 if auto_expand {
                     self.console_expanded = true;
                 }
+                if console_changed {
+                    self.mark_log_server_dirty();
+                }
             }
             Event::TabSelect(idx) => {
-                // Hide WebView when switching tabs
-                webview::set_visible(false);
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() {
                         ws.active_tab = idx;
                     }
                 }
-                return self.scroll_to_active_tab();
+                let scroll_task = self.scroll_to_active_tab();
+                if let Some(html) = self.active_inline_webview_html() {
+                    let bounds = self.calculate_webview_bounds();
+                    return Task::batch([scroll_task, Self::show_webview(html, bounds)]);
+                }
+                webview::set_visible(false);
+                return scroll_task;
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
@@ -4247,10 +4444,16 @@ fi
             Event::ViewFile(path) => {
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
+                let is_html = TabState::is_html_file(&path);
+                #[cfg(feature = "excalidraw")]
+                let has_webview_content =
+                    is_markdown || is_html || excalidraw::is_excalidraw_file(&path);
+                #[cfg(not(feature = "excalidraw"))]
+                let has_webview_content = is_markdown || is_html;
                 let mut request: Option<(usize, PathBuf)> = None;
 
-                // Hide WebView if switching to non-markdown
-                if !is_markdown && webview::is_active() {
+                // Hide WebView if switching to non-webview file
+                if !has_webview_content && webview::is_active() {
                     webview::set_visible(false);
                 }
 
@@ -4269,10 +4472,7 @@ fi
                     return Self::request_file_load(tab_id, file_path, is_dark_theme);
                 }
 
-                // Markdown uses Iced-native renderer inline; WebView only for "View in Browser"
-                if is_markdown && webview::is_active() {
-                    webview::set_visible(false);
-                }
+                // Inline WebView files (markdown/html/excalidraw) are shown once load completes.
             }
             Event::CloseFileView => {
                 // Hide WebView
@@ -4289,8 +4489,7 @@ fi
             Event::CopyFileContent => {
                 if let Some(tab) = self.active_tab() {
                     if !tab.file_content.is_empty() {
-                        let content = tab.file_content.join("\n");
-                        return iced::clipboard::write(content);
+                        return iced::clipboard::write(tab.file_content.clone());
                     }
                 }
             }
@@ -4310,11 +4509,14 @@ fi
                 self.save_config();
                 self.recreate_terminals();
 
-                // Re-render markdown if viewing one
+                // Re-render markdown/excalidraw if viewing one
                 let is_dark = self.theme == AppTheme::Dark;
                 if let Some(tab) = self.active_tab_mut() {
                     if let Some(path) = &tab.viewing_file_path.clone() {
-                        if TabState::is_markdown_file(path) {
+                        let needs_reload = TabState::is_markdown_file(path);
+                        #[cfg(feature = "excalidraw")]
+                        let needs_reload = needs_reload || excalidraw::is_excalidraw_file(path);
+                        if needs_reload {
                             return Self::request_file_load(tab.id, path.clone(), is_dark);
                         }
                     }
@@ -4523,12 +4725,26 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     if tab.repo_path == snapshot.repo_path {
-                        tab.repo_name = snapshot.repo_name;
-                        tab.branch_name = snapshot.branch_name;
-                        tab.is_git_repo = snapshot.is_git_repo;
-                        tab.staged = snapshot.staged;
-                        tab.unstaged = snapshot.unstaged;
-                        tab.untracked = snapshot.untracked;
+                        // Guard against transient false negatives from background tasks:
+                        // if discover() succeeds for the current path, keep git state.
+                        let still_git = Repository::discover(&tab.repo_path).is_ok();
+
+                        if snapshot.is_git_repo {
+                            tab.repo_name = snapshot.repo_name;
+                            tab.branch_name = snapshot.branch_name;
+                            tab.is_git_repo = true;
+                            tab.staged = snapshot.staged;
+                            tab.unstaged = snapshot.unstaged;
+                            tab.untracked = snapshot.untracked;
+                        } else if !still_git {
+                            tab.is_git_repo = false;
+                            tab.staged = snapshot.staged;
+                            tab.unstaged = snapshot.unstaged;
+                            tab.untracked = snapshot.untracked;
+                        } else {
+                            tab.is_git_repo = true;
+                        }
+
                         tab.last_poll = Instant::now();
                     }
                 }
@@ -4560,6 +4776,10 @@ fi
                 }
             }
             Event::FileLoaded(snapshot) => {
+                // Extract WebView HTML before mutable borrow is released
+                let mut inline_webview_html: Option<String> = None;
+                let mut hide_webview = false;
+
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -4571,12 +4791,53 @@ fi
                         tab.webview_content = snapshot.webview_content;
                         tab.image_handle =
                             snapshot.image_path.as_ref().map(image::Handle::from_path);
+
+                        #[cfg(feature = "excalidraw")]
+                        let is_excalidraw = tab
+                            .viewing_file_path
+                            .as_ref()
+                            .map(|p| excalidraw::is_excalidraw_file(p))
+                            .unwrap_or(false);
+                        #[cfg(not(feature = "excalidraw"))]
+                        let is_excalidraw = false;
+
+                        let is_markdown_webview = tab
+                            .viewing_file_path
+                            .as_ref()
+                            .map(|p| TabState::is_markdown_file(p))
+                            .unwrap_or(false)
+                            && tab.webview_content.is_some();
+                        let is_html_webview = tab
+                            .viewing_file_path
+                            .as_ref()
+                            .map(|p| TabState::is_html_file(p))
+                            .unwrap_or(false);
+
                         if let Some(html) = &tab.webview_content {
-                            webview::update_content(html);
+                            if is_excalidraw || is_markdown_webview || is_html_webview {
+                                inline_webview_html = Some(html.clone());
+                            } else {
+                                webview::update_content(html);
+                                hide_webview = true;
+                            }
+                        } else {
+                            hide_webview = true;
                         }
-                        self.mark_log_server_dirty();
                     }
                 }
+
+                if hide_webview {
+                    webview::set_visible(false);
+                }
+
+                // Show inline WebView after mutable borrow is released
+                if let Some(html) = inline_webview_html {
+                    let bounds = self.calculate_webview_bounds();
+                    self.mark_log_server_dirty();
+                    return Self::show_webview(html, bounds);
+                }
+
+                self.mark_log_server_dirty();
             }
             Event::LogServerSyncComplete => {
                 self.log_server_sync_in_flight = false;
@@ -4687,7 +4948,6 @@ fi
                 eprintln!("[STT] Error: {}", e);
             }
             Event::WorkspaceSelect(idx) => {
-                webview::set_visible(false);
                 self.editing_console_command = None;
                 if idx < self.workspaces.len() && idx != self.active_workspace_idx {
                     let viewport_width = self.content_viewport_width();
@@ -4721,6 +4981,15 @@ fi
                         ),
                     );
                     let bar_task = self.scroll_to_active_workspace_bar();
+                    if let Some(html) = self.active_inline_webview_html() {
+                        let bounds = self.calculate_webview_bounds();
+                        return Task::batch([
+                            slide_task,
+                            bar_task,
+                            Self::show_webview(html, bounds),
+                        ]);
+                    }
+                    webview::set_visible(false);
                     return Task::batch([slide_task, bar_task]);
                 }
             }
@@ -4856,6 +5125,7 @@ fi
                 self.add_tab_to_workspace_with_command(
                     &mut workspace,
                     path,
+                    None,
                     Some("claude".to_string()),
                 );
                 self.workspaces.push(workspace);
@@ -5058,24 +5328,63 @@ fi
 
     /// Calculate WebView bounds based on current layout
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
-        let tab_bar_height = 33.0; // tabs row (~24px buttons + 8px padding) + 1px separator
-        let header_height = 45.0; // file viewer header
+        let tab_bar_height = 33.0; // top tab strip
+        let file_header_height = 40.0; // file viewer header row (Back/View in Browser/Close)
         let workspace_bar_height = 28.0; // bottom workspace bar + 1px border
         let x = if self.sidebar_collapsed {
             SPINE_WIDTH + 36.0 + 1.0 // spine + icon rail + border
         } else {
             SPINE_WIDTH + self.sidebar_width + 4.0 // spine + sidebar + divider
         };
-        let y = tab_bar_height + header_height;
         let width = (self.window_size.0 - x).max(100.0);
-        // Subtract console panel height + workspace bar
+
+        // Subtract console panel height + workspace bar (reserved at the bottom)
         let console_h = if self.console_expanded {
             self.console_height + CONSOLE_DIVIDER_HEIGHT
         } else {
             CONSOLE_HEADER_HEIGHT
         };
-        let height = (self.window_size.1 - y - console_h - workspace_bar_height).max(100.0);
+
+        // wry child-WebView coordinates behave bottom-origin on macOS in this app.
+        // Place the child above bottom panels and reserve top chrome (tabs + file header).
+        let y = console_h + workspace_bar_height;
+        let top_reserved = tab_bar_height + file_header_height;
+        let height = (self.window_size.1 - y - top_reserved).max(100.0);
         (x, y, width, height)
+    }
+
+    /// Create or update the embedded WebView with HTML content.
+    /// Uses iced::window::run to get the window handle for wry.
+    fn show_webview(html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+        eprintln!(
+            "show_webview: active={}, bounds=({}, {}, {}, {})",
+            webview::is_active(),
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3
+        );
+        // Reuse the existing WebView when possible to avoid expensive recreation churn.
+        if webview::is_active() {
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::update_content(&html);
+            webview::set_visible(true);
+            return Task::none();
+        }
+
+        webview::set_pending_content(html, bounds);
+        iced::window::oldest().then(|opt_id| {
+            if let Some(id) = opt_id {
+                iced::window::run(id, |window| {
+                    if let Err(e) = webview::try_create_with_window(window) {
+                        eprintln!("Failed to create WebView: {e}");
+                    }
+                })
+                .discard()
+            } else {
+                Task::none()
+            }
+        })
     }
 
     fn recreate_terminals(&mut self) {
@@ -6953,11 +7262,29 @@ fi
             .map(|p| p.display().to_string())
             .unwrap_or(file_name.clone());
 
-        // Check if this is a markdown file with rendered content
-        let is_markdown = tab.webview_content.is_some();
+        // Determine file viewer mode by extension/state.
+        let is_markdown = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| TabState::is_markdown_file(p))
+            .unwrap_or(false);
+        let is_html = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| TabState::is_html_file(p))
+            .unwrap_or(false);
+        #[cfg(feature = "excalidraw")]
+        let is_excalidraw = tab
+            .viewing_file_path
+            .as_ref()
+            .map(|p| excalidraw::is_excalidraw_file(p))
+            .unwrap_or(false);
+        #[cfg(not(feature = "excalidraw"))]
+        let is_excalidraw = false;
+        let is_markdown_webview = is_markdown && tab.webview_content.is_some();
 
         let header_bg = theme.bg_overlay();
-        let header = if is_markdown {
+        let header = if is_markdown || is_html || is_excalidraw {
             // Markdown header with "View in Browser" button for Mermaid support
             row![
                 text(rel_path).size(font).color(theme.text_primary()),
@@ -7030,6 +7357,9 @@ fi
                 .height(Length::Fill)
                 .width(Length::Fill),
             );
+        } else if is_excalidraw || is_markdown_webview || is_html {
+            // Excalidraw, Mermaid-markdown, and HTML render inline via WebView.
+            content = content.push(iced::widget::Space::new().height(Length::Fill));
         } else if is_markdown {
             // Render markdown with Iced-native formatting
             content = content.push(self.view_markdown_content(tab));
@@ -7044,7 +7374,7 @@ fi
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
 
-            for (i, line) in tab.file_content.iter().enumerate() {
+            for (i, line) in tab.file_content.lines().enumerate() {
                 let line_num = format!("{:4}", i + 1);
 
                 // Simple syntax highlighting based on extension
@@ -7108,7 +7438,7 @@ fi
         let mut table_rows: Vec<Vec<String>> = Vec::new();
         let mut table_has_header = false;
 
-        for line in &tab.file_content {
+        for line in tab.file_content.lines() {
             let trimmed = line.trim();
 
             // Table row accumulation — detect end of table and render
@@ -7195,7 +7525,7 @@ fi
             }
 
             if in_code_block {
-                code_block_content.push(line.clone());
+                code_block_content.push(line.to_string());
                 continue;
             }
 

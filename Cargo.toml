@@ -26,6 +26,7 @@ cpal = { version = "0.15", optional = true }
 [features]
 default = []
 stt = ["whisper-rs", "cpal"]
+excalidraw = []
 
 [package.metadata.bundle]
 name = "GitTerm"
