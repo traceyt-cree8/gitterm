@@ -28,11 +28,12 @@ open target/GitTerm.app
 
 ### Features Overview
 
-#### HTTP Log Server (localhost:3030)
+#### HTTP Log Server (localhost:3030, optional)
 - View all terminal logs in your browser
 - Perfect text selection and copy
 - Live search
 - Auto-updates every 5 seconds
+- Disabled by default; toggle from the app menu/UI when needed
 
 #### File Viewer
 - Click any file to preview
@@ -51,6 +52,13 @@ open target/GitTerm.app
 ## Building for Other Platforms
 
 See [BUILD.md](BUILD.md) for detailed build instructions for Windows and Linux.
+
+## Performance Notes
+
+See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for:
+- recent rendering/performance changes
+- profiling guidance (`GITTERM_PERF=1`)
+- all tuning knobs and recommended adjustment order
 
 ### Quick Cross-Platform Build (GitHub Actions)
 

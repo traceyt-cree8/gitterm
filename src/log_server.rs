@@ -102,6 +102,9 @@ pub async fn start_server(state: ServerState) {
 
     println!("Log server started at http://localhost:{}", port);
     server.await;
+    if let Ok(mut p) = bound_port.lock() {
+        *p = None;
+    }
     println!("Log server shut down");
 }
 

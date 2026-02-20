@@ -20,6 +20,7 @@ warp = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util"] }
 chrono = "0.4"
 libc = "0.2"
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 whisper-rs = { version = "0.15", optional = true }
 cpal = { version = "0.15", optional = true }
 

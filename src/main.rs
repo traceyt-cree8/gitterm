@@ -10,17 +10,25 @@ use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 #[cfg(feature = "stt")]
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::util::LinesWithEndings;
 
 #[cfg(feature = "excalidraw")]
 mod excalidraw;
 mod log_server;
 mod markdown;
+mod services;
 mod webview;
 
 // Menu item IDs stored globally for event matching
@@ -33,6 +41,7 @@ struct MenuIds {
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
     toggle_theme: muda::MenuId,
+    toggle_log_server: muda::MenuId,
     clear_terminal: muda::MenuId,
 }
 
@@ -123,6 +132,14 @@ fn setup_menu_bar() {
             muda::accelerator::Code::KeyT,
         )),
     );
+    let toggle_log_server = MenuItem::new(
+        "Toggle Local Log Server",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::KeyL,
+        )),
+    );
 
     view_menu
         .append_items(&[
@@ -130,6 +147,7 @@ fn setup_menu_bar() {
             &ui_font_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
+            &toggle_log_server,
         ])
         .unwrap();
 
@@ -154,6 +172,7 @@ fn setup_menu_bar() {
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
+        toggle_log_server: toggle_log_server.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
     });
 
@@ -186,6 +205,8 @@ struct Config {
     console_height: f32,
     #[serde(default = "default_console_expanded")]
     console_expanded: bool,
+    #[serde(default = "default_log_server_enabled")]
+    log_server_enabled: bool,
     #[cfg(feature = "stt")]
     #[serde(default = "default_stt_enabled")]
     stt_enabled: bool,
@@ -212,6 +233,9 @@ fn default_console_height() -> f32 {
 fn default_console_expanded() -> bool {
     true
 }
+fn default_log_server_enabled() -> bool {
+    false
+}
 #[cfg(feature = "stt")]
 fn default_stt_enabled() -> bool {
     true
@@ -229,6 +253,7 @@ impl Default for Config {
             show_hidden: false,
             console_height: DEFAULT_CONSOLE_HEIGHT,
             console_expanded: true,
+            log_server_enabled: false,
             #[cfg(feature = "stt")]
             stt_enabled: true,
             #[cfg(feature = "stt")]
@@ -753,6 +778,17 @@ struct FileTreeEntry {
     is_dir: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SyntaxHighlightSegment {
+    text: String,
+    color: iced::Color,
+}
+
+#[derive(Debug, Clone)]
+struct SyntaxHighlightLine {
+    segments: Vec<SyntaxHighlightSegment>,
+}
+
 // Claude config scope
 #[derive(Debug, Clone, PartialEq)]
 enum ConfigScope {
@@ -826,6 +862,698 @@ const CONSOLE_HEADER_HEIGHT: f32 = 32.0;
 const CONSOLE_DIVIDER_HEIGHT: f32 = 3.0;
 const DEFAULT_CONSOLE_HEIGHT: f32 = 200.0;
 const MAX_CONSOLE_LINES: usize = 1000;
+const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
+const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
+const LARGE_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
+const LARGE_TEXT_PREVIEW_LINES: usize = 2000;
+const MAX_SYNTAX_HIGHLIGHT_BYTES: usize = 96 * 1024;
+const MAX_SYNTAX_HIGHLIGHT_LINES: usize = 1200;
+const MAX_SYNTAX_HIGHLIGHT_SEGMENTS: usize = 8000;
+const MAX_FILE_VIEW_RENDER_LINES: usize = 1200;
+const MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX: usize = 1200;
+const MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES: usize = 768 * 1024;
+const MAX_DIFF_SYNTAX_HIGHLIGHT_LINES: usize = 900;
+const MAX_DIFF_SYNTAX_SEGMENTS: usize = 9000;
+const MAX_DIFF_VIEW_RENDER_LINES: usize = 1200;
+const SYNTAX_HIGHLIGHT_CACHE_MAX_ENTRIES: usize = 64;
+const DIFF_SYNTAX_CACHE_MAX_ENTRIES: usize = 64;
+const FILE_SYNTAX_INITIAL_LINES: usize = 120;
+const FILE_SYNTAX_SCROLL_PREFETCH_LINES: usize = 220;
+const FILE_VIEW_LINE_HEIGHT_ESTIMATE: f32 = 22.0;
+const LOADING_INDICATOR_DELAY_MS: u64 = 120;
+const PERF_REPORT_INTERVAL_MS: u64 = 15000;
+
+fn perf_enabled() -> bool {
+    static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
+    *PERF_ENABLED.get_or_init(|| {
+        std::env::var("GITTERM_PERF")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+macro_rules! perf_log {
+    ($($arg:tt)*) => {{
+        if perf_enabled() {
+            eprintln!("[perf] {}", format_args!($($arg)*));
+        }
+    }};
+}
+
+fn maybe_log_file_view_build(
+    path: Option<&Path>,
+    total_lines: usize,
+    rendered_lines: usize,
+    syntax: bool,
+    took: Duration,
+) {
+    if !perf_enabled() {
+        return;
+    }
+    let took_ms = took.as_millis();
+    if took_ms < 16 {
+        return;
+    }
+
+    static LAST_LOG: OnceLock<Mutex<(u64, Instant)>> = OnceLock::new();
+    let path_hash = path
+        .map(|p| {
+            let mut hasher = DefaultHasher::new();
+            p.hash(&mut hasher);
+            hasher.finish()
+        })
+        .unwrap_or(0);
+    let gate =
+        LAST_LOG.get_or_init(|| Mutex::new((u64::MAX, Instant::now() - Duration::from_secs(60))));
+
+    let mut should_log = false;
+    if let Ok(mut last) = gate.lock() {
+        if last.0 != path_hash || last.1.elapsed() >= Duration::from_secs(2) {
+            *last = (path_hash, Instant::now());
+            should_log = true;
+        }
+    } else {
+        should_log = true;
+    }
+
+    if should_log {
+        let path_display = path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        perf_log!(
+            "file_view_build path={} total_lines={} rendered_lines={} syntax={} took={}ms",
+            path_display,
+            total_lines,
+            rendered_lines,
+            syntax,
+            took_ms
+        );
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct SyntaxHighlightCacheKey {
+    path: PathBuf,
+    modified_unix_nanos: u128,
+    file_len: u64,
+    is_dark_theme: bool,
+    line_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SyntaxHighlightCacheEntry {
+    lines: Option<Vec<SyntaxHighlightLine>>,
+    notice: Option<String>,
+}
+
+#[derive(Default)]
+struct SyntaxHighlightCache {
+    entries: HashMap<SyntaxHighlightCacheKey, SyntaxHighlightCacheEntry>,
+    lru: VecDeque<SyntaxHighlightCacheKey>,
+}
+
+impl SyntaxHighlightCache {
+    fn get(&mut self, key: &SyntaxHighlightCacheKey) -> Option<SyntaxHighlightCacheEntry> {
+        let entry = self.entries.get(key).cloned()?;
+        if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key.clone());
+        Some(entry)
+    }
+
+    fn put(&mut self, key: SyntaxHighlightCacheKey, entry: SyntaxHighlightCacheEntry) {
+        if self.entries.contains_key(&key) {
+            if let Some(pos) = self.lru.iter().position(|existing| existing == &key) {
+                self.lru.remove(pos);
+            }
+        }
+
+        self.entries.insert(key.clone(), entry);
+        self.lru.push_back(key);
+
+        while self.entries.len() > SYNTAX_HIGHLIGHT_CACHE_MAX_ENTRIES {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.entries.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn syntax_highlight_cache() -> &'static Mutex<SyntaxHighlightCache> {
+    static CACHE: OnceLock<Mutex<SyntaxHighlightCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SyntaxHighlightCache::default()))
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct FileVersionSignature {
+    modified_unix_nanos: u128,
+    file_len: u64,
+}
+
+fn file_version_signature(path: &Path) -> Option<FileVersionSignature> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+
+    Some(FileVersionSignature {
+        modified_unix_nanos,
+        file_len: metadata.len(),
+    })
+}
+
+fn syntax_highlight_cache_key(
+    path: &Path,
+    is_dark_theme: bool,
+    line_count: usize,
+) -> Option<SyntaxHighlightCacheKey> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+
+    Some(SyntaxHighlightCacheKey {
+        path: path.to_path_buf(),
+        modified_unix_nanos,
+        file_len: metadata.len(),
+        is_dark_theme,
+        line_count,
+    })
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct DiffSyntaxCacheKey {
+    file_path: String,
+    is_staged: bool,
+    is_dark_theme: bool,
+    line_count: usize,
+    content_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DiffSyntaxCacheEntry {
+    lines: Option<Vec<Vec<SyntaxHighlightSegment>>>,
+    notice: Option<String>,
+}
+
+#[derive(Default)]
+struct DiffSyntaxCache {
+    entries: HashMap<DiffSyntaxCacheKey, DiffSyntaxCacheEntry>,
+    lru: VecDeque<DiffSyntaxCacheKey>,
+}
+
+impl DiffSyntaxCache {
+    fn get(&mut self, key: &DiffSyntaxCacheKey) -> Option<DiffSyntaxCacheEntry> {
+        let entry = self.entries.get(key).cloned()?;
+        if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key.clone());
+        Some(entry)
+    }
+
+    fn put(&mut self, key: DiffSyntaxCacheKey, entry: DiffSyntaxCacheEntry) {
+        if self.entries.contains_key(&key) {
+            if let Some(pos) = self.lru.iter().position(|existing| existing == &key) {
+                self.lru.remove(pos);
+            }
+        }
+
+        self.entries.insert(key.clone(), entry);
+        self.lru.push_back(key);
+
+        while self.entries.len() > DIFF_SYNTAX_CACHE_MAX_ENTRIES {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.entries.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn diff_syntax_cache() -> &'static Mutex<DiffSyntaxCache> {
+    static CACHE: OnceLock<Mutex<DiffSyntaxCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DiffSyntaxCache::default()))
+}
+
+fn diff_line_type_code(line_type: &DiffLineType) -> u8 {
+    match line_type {
+        DiffLineType::Context => 0,
+        DiffLineType::Addition => 1,
+        DiffLineType::Deletion => 2,
+        DiffLineType::Header => 3,
+    }
+}
+
+fn hash_diff_lines(diff_lines: &[DiffLine]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for line in diff_lines {
+        diff_line_type_code(&line.line_type).hash(&mut hasher);
+        line.content.hash(&mut hasher);
+        line.old_line_num.hash(&mut hasher);
+        line.new_line_num.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn syntect_syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn syntect_theme_set() -> &'static ThemeSet {
+    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+    THEME_SET.get_or_init(ThemeSet::load_defaults)
+}
+
+fn syntect_theme_for(is_dark_theme: bool) -> &'static syntect::highlighting::Theme {
+    let theme_set = syntect_theme_set();
+    let preferred = if is_dark_theme {
+        [
+            "base16-eighties.dark",
+            "base16-ocean.dark",
+            "Solarized (dark)",
+        ]
+    } else {
+        ["InspiredGitHub", "base16-ocean.light", "Solarized (light)"]
+    };
+
+    for name in preferred {
+        if let Some(theme) = theme_set.themes.get(name) {
+            return theme;
+        }
+    }
+
+    theme_set
+        .themes
+        .values()
+        .next()
+        .expect("syntect default themes should not be empty")
+}
+
+fn warm_syntect_engine() {
+    let started = Instant::now();
+    let syntax_set = syntect_syntax_set();
+    let _ = syntect_theme_set();
+
+    for sample in [
+        "warmup.rs",
+        "warmup.ts",
+        "warmup.tsx",
+        "warmup.js",
+        "warmup.jsx",
+        "warmup.json",
+        "warmup.md",
+        "warmup.toml",
+        "warmup.yaml",
+        "warmup.html",
+        "warmup.css",
+        "warmup.sh",
+    ] {
+        let _ = syntect_syntax_for_path(Path::new(sample));
+    }
+
+    for token in [
+        "rust",
+        "typescript",
+        "tsx",
+        "javascript",
+        "json",
+        "markdown",
+    ] {
+        let _ = syntax_set.find_syntax_by_token(token);
+    }
+
+    let _ = syntect_theme_for(true);
+    let _ = syntect_theme_for(false);
+
+    perf_log!("syntect warmup took={}ms", started.elapsed().as_millis());
+}
+
+fn syntect_syntax_for_path(path: &Path) -> &'static SyntaxReference {
+    let syntax_set = syntect_syntax_set();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if let Some(syntax) = syntax_set.find_syntax_by_extension(&ext) {
+            return syntax;
+        }
+
+        // Some packaged syntax sets do not register TS/TSX extensions.
+        // Fall back to close JavaScript/TypeScript aliases before plain text.
+        let alias_extensions: &[&str] = match ext.as_str() {
+            "ts" => &["tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+            "tsx" => &["ts", "jsx", "js", "mjs", "cjs"],
+            "mts" | "cts" => &["ts", "js", "mjs", "cjs"],
+            "jsx" => &["js", "tsx", "ts", "mjs", "cjs"],
+            "mjs" | "cjs" => &["js", "jsx", "ts", "tsx"],
+            _ => &[],
+        };
+        for alias in alias_extensions {
+            if let Some(syntax) = syntax_set.find_syntax_by_extension(alias) {
+                return syntax;
+            }
+        }
+
+        let alias_tokens: &[&str] = match ext.as_str() {
+            "ts" | "tsx" | "mts" | "cts" => &["typescript", "ts", "tsx", "javascript", "js", "jsx"],
+            "js" | "jsx" | "mjs" | "cjs" => &["javascript", "js", "jsx", "typescript", "ts", "tsx"],
+            _ => &[],
+        };
+        for token in alias_tokens {
+            if let Some(syntax) = syntax_set.find_syntax_by_token(token) {
+                return syntax;
+            }
+        }
+
+        let alias_names: &[&str] = match ext.as_str() {
+            "ts" | "tsx" | "mts" | "cts" => &[
+                "TypeScript",
+                "TypeScript React",
+                "JavaScript",
+                "JavaScript (Babel)",
+            ],
+            "js" | "jsx" | "mjs" | "cjs" => &["JavaScript", "JavaScript (Babel)", "TypeScript"],
+            _ => &[],
+        };
+        for name in alias_names {
+            if let Some(syntax) = syntax_set.find_syntax_by_name(name) {
+                return syntax;
+            }
+        }
+    }
+
+    syntax_set.find_syntax_plain_text()
+}
+
+fn syntect_color_to_iced(color: syntect::highlighting::Color) -> iced::Color {
+    // Keep syntax colors fully opaque in the Iced viewer; some themes encode alpha in ways
+    // that can make token colors appear washed out or invisible.
+    let _ = color.a;
+    iced::Color::from_rgb8(color.r, color.g, color.b)
+}
+
+fn build_syntax_highlight_lines(
+    path: &Path,
+    content: &str,
+    is_dark_theme: bool,
+) -> (Option<Vec<SyntaxHighlightLine>>, Option<String>) {
+    if content.is_empty() {
+        return (Some(Vec::new()), None);
+    }
+
+    let total_line_count = LinesWithEndings::from(content).count();
+    let cache_key = syntax_highlight_cache_key(path, is_dark_theme, total_line_count);
+    if let Some(key) = cache_key.as_ref() {
+        if let Ok(mut cache) = syntax_highlight_cache().lock() {
+            if let Some(entry) = cache.get(key) {
+                perf_log!("syntect cache_hit path={}", path.display());
+                return (entry.lines, entry.notice);
+            }
+        }
+    }
+
+    let total_bytes = content.len();
+
+    let syntax_set = syntect_syntax_set();
+    let syntax = syntect_syntax_for_path(path);
+    let theme = syntect_theme_for(is_dark_theme);
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let fallback_color = if is_dark_theme {
+        color!(0xcdd6f4)
+    } else {
+        color!(0x4c4f69)
+    };
+
+    let mut highlighted_lines =
+        Vec::with_capacity(total_line_count.min(MAX_SYNTAX_HIGHLIGHT_LINES));
+    let mut parse_errors = 0usize;
+    let mut highlighted_line_count = 0usize;
+    let mut highlighted_bytes = 0usize;
+    let mut highlighted_segment_count = 0usize;
+    let mut truncation_notice: Option<String> = None;
+
+    for line_with_ending in LinesWithEndings::from(content) {
+        let line_bytes = line_with_ending.len();
+        if highlighted_line_count >= MAX_SYNTAX_HIGHLIGHT_LINES {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first {} lines for performance.",
+                MAX_SYNTAX_HIGHLIGHT_LINES
+            ));
+            break;
+        }
+        if highlighted_bytes + line_bytes > MAX_SYNTAX_HIGHLIGHT_BYTES {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first ~{} KB for performance.",
+                MAX_SYNTAX_HIGHLIGHT_BYTES / 1024
+            ));
+            break;
+        }
+
+        let line = line_with_ending.trim_end_matches(['\r', '\n']);
+        let mut segments = Vec::new();
+        if let Ok(ranges) = highlighter.highlight_line(line_with_ending, syntax_set) {
+            for (style, token) in ranges {
+                let token = token.trim_end_matches(['\r', '\n']);
+                if token.is_empty() {
+                    continue;
+                }
+                segments.push(SyntaxHighlightSegment {
+                    text: token.to_string(),
+                    color: syntect_color_to_iced(style.foreground),
+                });
+            }
+        } else {
+            parse_errors += 1;
+        }
+
+        highlighted_segment_count += segments.len();
+        if highlighted_segment_count > MAX_SYNTAX_HIGHLIGHT_SEGMENTS {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first {} tokens for performance.",
+                MAX_SYNTAX_HIGHLIGHT_SEGMENTS
+            ));
+            break;
+        }
+
+        if segments.is_empty() {
+            let fallback_text = if line.is_empty() { " " } else { line };
+            segments.push(SyntaxHighlightSegment {
+                text: fallback_text.to_string(),
+                color: fallback_color,
+            });
+        }
+
+        highlighted_line_count += 1;
+        highlighted_bytes += line_bytes;
+        highlighted_lines.push(SyntaxHighlightLine { segments });
+    }
+
+    perf_log!(
+        "syntect path={} syntax={} lines={} highlighted_lines={} bytes={} highlighted_bytes={} parse_errors={} truncated={}",
+        path.display(),
+        syntax.name,
+        total_line_count,
+        highlighted_lines.len(),
+        total_bytes,
+        highlighted_bytes,
+        parse_errors,
+        truncation_notice.is_some()
+    );
+    let lines = Some(highlighted_lines);
+    if let Some(key) = cache_key {
+        if let Ok(mut cache) = syntax_highlight_cache().lock() {
+            cache.put(
+                key,
+                SyntaxHighlightCacheEntry {
+                    lines: lines.clone(),
+                    notice: truncation_notice.clone(),
+                },
+            );
+        }
+    }
+
+    (lines, truncation_notice)
+}
+
+fn build_diff_syntax_highlight_lines_cached(
+    file_path: &str,
+    is_staged: bool,
+    diff_lines: &[DiffLine],
+    is_dark_theme: bool,
+) -> (Option<Vec<Vec<SyntaxHighlightSegment>>>, Option<String>) {
+    if diff_lines.is_empty() {
+        return (Some(Vec::new()), None);
+    }
+
+    let cache_key = DiffSyntaxCacheKey {
+        file_path: file_path.to_string(),
+        is_staged,
+        is_dark_theme,
+        line_count: diff_lines.len(),
+        content_hash: hash_diff_lines(diff_lines),
+    };
+
+    if let Ok(mut cache) = diff_syntax_cache().lock() {
+        if let Some(entry) = cache.get(&cache_key) {
+            perf_log!(
+                "syntect diff cache_hit path={} staged={} lines={}",
+                file_path,
+                is_staged,
+                diff_lines.len()
+            );
+            return (entry.lines, entry.notice);
+        }
+    }
+
+    let (lines, notice) = build_diff_syntax_highlight_lines(file_path, diff_lines, is_dark_theme);
+    if let Ok(mut cache) = diff_syntax_cache().lock() {
+        cache.put(
+            cache_key,
+            DiffSyntaxCacheEntry {
+                lines: lines.clone(),
+                notice: notice.clone(),
+            },
+        );
+    }
+
+    (lines, notice)
+}
+
+fn build_diff_syntax_highlight_lines(
+    file_path: &str,
+    diff_lines: &[DiffLine],
+    is_dark_theme: bool,
+) -> (Option<Vec<Vec<SyntaxHighlightSegment>>>, Option<String>) {
+    if diff_lines.is_empty() {
+        return (Some(Vec::new()), None);
+    }
+
+    let approx_bytes: usize = diff_lines.iter().map(|line| line.content.len() + 1).sum();
+
+    let syntax_set = syntect_syntax_set();
+    let syntax = syntect_syntax_for_path(Path::new(file_path));
+    let theme = syntect_theme_for(is_dark_theme);
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let fallback_color = if is_dark_theme {
+        color!(0xcdd6f4)
+    } else {
+        color!(0x4c4f69)
+    };
+
+    let mut highlighted = Vec::with_capacity(diff_lines.len());
+    let mut parse_errors = 0usize;
+    let mut segment_count = 0usize;
+    let mut highlighted_lines = 0usize;
+    let mut highlighted_bytes = 0usize;
+    let mut truncation_notice: Option<String> = None;
+    let mut highlighting_budget_exhausted = false;
+
+    for line in diff_lines {
+        if line.line_type == DiffLineType::Header || highlighting_budget_exhausted {
+            highlighted.push(Vec::new());
+            continue;
+        }
+
+        if highlighted_lines >= MAX_DIFF_SYNTAX_HIGHLIGHT_LINES {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first {} diff lines for performance.",
+                MAX_DIFF_SYNTAX_HIGHLIGHT_LINES
+            ));
+            highlighting_budget_exhausted = true;
+            highlighted.push(Vec::new());
+            continue;
+        }
+
+        let line_bytes = line.content.len() + 1;
+        if highlighted_bytes + line_bytes > MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first ~{} KB of diff for performance.",
+                MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES / 1024
+            ));
+            highlighting_budget_exhausted = true;
+            highlighted.push(Vec::new());
+            continue;
+        }
+
+        let mut content_with_newline = line.content.clone();
+        content_with_newline.push('\n');
+
+        let mut segments = Vec::new();
+        match highlighter.highlight_line(&content_with_newline, syntax_set) {
+            Ok(ranges) => {
+                for (style, token) in ranges {
+                    let token = token.trim_end_matches(['\r', '\n']);
+                    if token.is_empty() {
+                        continue;
+                    }
+                    segments.push(SyntaxHighlightSegment {
+                        text: token.to_string(),
+                        color: syntect_color_to_iced(style.foreground),
+                    });
+                }
+            }
+            Err(_) => {
+                parse_errors += 1;
+            }
+        }
+
+        if segments.is_empty() {
+            let fallback_text = if line.content.is_empty() {
+                " "
+            } else {
+                &line.content
+            };
+            segments.push(SyntaxHighlightSegment {
+                text: fallback_text.to_string(),
+                color: fallback_color,
+            });
+        }
+
+        segment_count += segments.len();
+        if segment_count > MAX_DIFF_SYNTAX_SEGMENTS {
+            truncation_notice = Some(format!(
+                "Syntax highlighting limited to first {} tokens for performance.",
+                MAX_DIFF_SYNTAX_SEGMENTS
+            ));
+            highlighting_budget_exhausted = true;
+            highlighted.push(Vec::new());
+            continue;
+        }
+
+        highlighted_lines += 1;
+        highlighted_bytes += line_bytes;
+        highlighted.push(segments);
+    }
+
+    perf_log!(
+        "syntect diff path={} syntax={} lines={} highlighted_lines={} bytes={} highlighted_bytes={} parse_errors={} truncated={}",
+        file_path,
+        syntax.name,
+        highlighted.len(),
+        highlighted_lines,
+        approx_bytes,
+        highlighted_bytes,
+        parse_errors,
+        truncation_notice.is_some()
+    );
+
+    (Some(highlighted), truncation_notice)
+}
 
 // Console panel status
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1243,9 +1971,17 @@ struct TabState {
     untracked: Vec<FileEntry>,
     branch_name: String,
     last_poll: Instant,
+    git_poll_interval_ms: u64,
+    git_unchanged_streak: u32,
+    last_git_status_hash: Option<u64>,
+    git_status_loading: bool,
     selected_file: Option<String>,
     selected_is_staged: bool,
     diff_lines: Vec<DiffLine>,
+    diff_load_in_progress: bool,
+    diff_load_started_at: Option<Instant>,
+    diff_syntax_lines: Option<Vec<Vec<SyntaxHighlightSegment>>>,
+    diff_syntax_notice: Option<String>,
     // For keyboard navigation
     file_index: i32,
     // Track when tab was created for delayed terminal display
@@ -1263,6 +1999,21 @@ struct TabState {
     image_handle: Option<image::Handle>,
     // Markdown WebView content (rendered HTML)
     webview_content: Option<String>,
+    // Optional notice shown in the file viewer (e.g. large-file preview mode)
+    file_preview_notice: Option<String>,
+    // Cached syntax-highlighted lines for plain-text/code files.
+    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
+    // Optional notice for partial/disabled syntax highlighting.
+    syntax_highlight_notice: Option<String>,
+    // True while async syntax highlighting is in-flight for the current file.
+    syntax_highlight_in_progress: bool,
+    // Highest line count requested so far for lazy syntax highlighting.
+    syntax_highlight_requested_lines: usize,
+    loaded_file_signature: Option<FileVersionSignature>,
+    file_load_in_progress: bool,
+    file_load_started_at: Option<Instant>,
+    last_view_file_request_path: Option<PathBuf>,
+    last_view_file_request_at: Option<Instant>,
     // Search state
     search: SearchState,
     // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
@@ -1292,10 +2043,18 @@ impl TabState {
             unstaged: Vec::new(),
             untracked: Vec::new(),
             branch_name: String::from("main"),
-            last_poll: Instant::now(),
+            last_poll: Instant::now() - Duration::from_millis(GIT_POLL_FAST_INTERVAL_MS),
+            git_poll_interval_ms: GIT_POLL_FAST_INTERVAL_MS,
+            git_unchanged_streak: 0,
+            last_git_status_hash: None,
+            git_status_loading: false,
             selected_file: None,
             selected_is_staged: false,
             diff_lines: Vec::new(),
+            diff_load_in_progress: false,
+            diff_load_started_at: None,
+            diff_syntax_lines: None,
+            diff_syntax_notice: None,
             file_index: -1,
             created_at: Instant::now(),
             terminal_title: None,
@@ -1306,6 +2065,16 @@ impl TabState {
             file_content: String::new(),
             image_handle: None,
             webview_content: None,
+            file_preview_notice: None,
+            syntax_highlight_lines: None,
+            syntax_highlight_notice: None,
+            syntax_highlight_in_progress: false,
+            syntax_highlight_requested_lines: 0,
+            loaded_file_signature: None,
+            file_load_in_progress: false,
+            file_load_started_at: None,
+            last_view_file_request_path: None,
+            last_view_file_request_at: None,
             search: SearchState::default(),
             needs_attention: false,
             startup_command: None,
@@ -1448,10 +2217,24 @@ impl TabState {
         self.file_content.clear();
         self.image_handle = None;
         self.webview_content = None;
+        self.file_preview_notice = None;
+        self.syntax_highlight_lines = None;
+        self.syntax_highlight_notice = None;
+        self.syntax_highlight_in_progress = false;
+        self.syntax_highlight_requested_lines = 0;
         self.viewing_file_path = Some(path.clone());
+
+        let file_size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
 
         #[cfg(feature = "excalidraw")]
         if excalidraw::is_excalidraw_file(path) {
+            if file_size > MAX_INLINE_WEBVIEW_BYTES {
+                self.file_preview_notice = Some(format!(
+                    "Inline preview skipped for large Excalidraw file ({}). Click \"View in Browser\".",
+                    format_bytes(file_size)
+                ));
+                return;
+            }
             if let Ok(content) = std::fs::read_to_string(path) {
                 if excalidraw::validate_excalidraw(&content) {
                     let html = excalidraw::render_excalidraw_html(&content, is_dark_theme);
@@ -1462,21 +2245,59 @@ impl TabState {
         }
 
         if Self::is_markdown_file(path) {
+            if file_size > MAX_INLINE_WEBVIEW_BYTES {
+                self.file_preview_notice = Some(format!(
+                    "Inline preview skipped for large Markdown file ({}). Click \"View in Browser\".",
+                    format_bytes(file_size)
+                ));
+                return;
+            }
             // Load as markdown - render to HTML and store for potential browser viewing
             if let Ok(content) = std::fs::read_to_string(path) {
                 let html = markdown::render_markdown_to_html(&content, is_dark_theme);
                 self.webview_content = Some(html);
             }
         } else if Self::is_html_file(path) {
+            if file_size > MAX_INLINE_WEBVIEW_BYTES {
+                self.file_preview_notice = Some(format!(
+                    "Inline preview skipped for large HTML file ({}). Click \"View in Browser\".",
+                    format_bytes(file_size)
+                ));
+                return;
+            }
             if let Ok(content) = std::fs::read_to_string(path) {
                 self.webview_content = Some(content);
             }
         } else if Self::is_image_file(path) {
             // Load as image
             self.image_handle = Some(image::Handle::from_path(path));
+        } else if file_size > MAX_FULL_TEXT_LOAD_BYTES {
+            if let Ok(preview) =
+                read_text_preview(path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
+            {
+                self.file_content = preview;
+            } else if let Ok(content) = std::fs::read_to_string(path) {
+                self.file_content = content;
+            }
+            self.file_preview_notice = Some(format!(
+                "Large file ({}): showing first {} lines (~{} KB).",
+                format_bytes(file_size),
+                LARGE_TEXT_PREVIEW_LINES,
+                LARGE_TEXT_PREVIEW_BYTES / 1024
+            ));
         } else if let Ok(content) = std::fs::read_to_string(path) {
             // Load as text
             self.file_content = content;
+        }
+
+        if self.webview_content.is_none()
+            && self.image_handle.is_none()
+            && !self.file_content.is_empty()
+        {
+            let (lines, notice) =
+                build_syntax_highlight_lines(path, &self.file_content, is_dark_theme);
+            self.syntax_highlight_lines = lines;
+            self.syntax_highlight_notice = notice;
         }
     }
 
@@ -1727,6 +2548,8 @@ impl TabState {
     #[allow(dead_code)]
     fn fetch_diff(&mut self, file_path: &str, staged: bool) {
         self.diff_lines.clear();
+        self.diff_syntax_lines = None;
+        self.diff_syntax_notice = None;
 
         let Ok(repo) = Repository::open(&self.repo_path) else {
             return;
@@ -2080,111 +2903,86 @@ fn status_char(status: Status, staged: bool) -> String {
     }
 }
 
-fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
-    let mut snapshot = GitStatusSnapshot {
-        tab_id,
-        repo_name: repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string()),
-        repo_path: repo_path.clone(),
-        branch_name: "main".to_string(),
-        is_git_repo: false,
-        staged: Vec::new(),
-        unstaged: Vec::new(),
-        untracked: Vec::new(),
-    };
+fn hash_file_entry_list(entries: &[FileEntry], hasher: &mut DefaultHasher) {
+    for entry in entries {
+        entry.path.hash(hasher);
+        entry.status.hash(hasher);
+        entry.is_staged.hash(hasher);
+    }
+}
 
-    if let Ok(repo) = Repository::open(&repo_path).or_else(|_| Repository::discover(&repo_path)) {
-        snapshot.is_git_repo = true;
-        if let Ok(head) = repo.head() {
-            if let Some(name) = head.shorthand() {
-                snapshot.branch_name = name.to_string();
-            }
-        }
+fn git_tab_state_hash(tab: &TabState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tab.is_git_repo.hash(&mut hasher);
+    tab.branch_name.hash(&mut hasher);
+    hash_file_entry_list(&tab.staged, &mut hasher);
+    hash_file_entry_list(&tab.unstaged, &mut hasher);
+    hash_file_entry_list(&tab.untracked, &mut hasher);
+    hasher.finish()
+}
 
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .include_ignored(false);
-
-        if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
-            for entry in statuses.iter() {
-                let path = entry.path().unwrap_or("").to_string();
-                let status = entry.status();
-
-                if status.contains(Status::INDEX_NEW)
-                    || status.contains(Status::INDEX_MODIFIED)
-                    || status.contains(Status::INDEX_DELETED)
-                    || status.contains(Status::INDEX_RENAMED)
-                {
-                    snapshot.staged.push(FileEntry {
-                        path: path.clone(),
-                        status: status_char(status, true),
-                        is_staged: true,
-                    });
-                }
-
-                if status.contains(Status::WT_MODIFIED)
-                    || status.contains(Status::WT_DELETED)
-                    || status.contains(Status::WT_RENAMED)
-                {
-                    snapshot.unstaged.push(FileEntry {
-                        path: path.clone(),
-                        status: status_char(status, false),
-                        is_staged: false,
-                    });
-                }
-
-                if status.contains(Status::WT_NEW) {
-                    snapshot.untracked.push(FileEntry {
-                        path,
-                        status: "?".to_string(),
-                        is_staged: false,
-                    });
-                }
-            }
-        }
+fn next_git_poll_interval_ms(is_git_repo: bool, has_changes: bool, unchanged_streak: u32) -> u64 {
+    if !is_git_repo {
+        return GIT_POLL_NON_REPO_INTERVAL_MS;
     }
 
-    snapshot
+    if has_changes {
+        return match unchanged_streak {
+            0..=2 => GIT_POLL_FAST_INTERVAL_MS,
+            3..=8 => GIT_POLL_MEDIUM_INTERVAL_MS,
+            _ => GIT_POLL_SLOW_INTERVAL_MS,
+        };
+    }
+
+    match unchanged_streak {
+        0..=1 => GIT_POLL_FAST_INTERVAL_MS,
+        2..=4 => GIT_POLL_MEDIUM_INTERVAL_MS,
+        5..=8 => GIT_POLL_SLOW_INTERVAL_MS,
+        _ => GIT_POLL_IDLE_INTERVAL_MS,
+    }
+}
+
+fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
+    services::collect_git_status(tab_id, repo_path)
 }
 
 fn collect_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> FileTreeSnapshot {
-    let mut dirs: Vec<FileTreeEntry> = Vec::new();
-    let mut files: Vec<FileTreeEntry> = Vec::new();
+    services::collect_file_tree(tab_id, current_dir, show_hidden)
+}
 
-    if let Ok(entries) = std::fs::read_dir(&current_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-            if name == "node_modules" || name == "target" {
-                continue;
-            }
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
-            let is_dir = path.is_dir();
-            let entry = FileTreeEntry { name, path, is_dir };
-            if is_dir {
-                dirs.push(entry);
-            } else {
-                files.push(entry);
-            }
+fn read_text_preview(path: &Path, max_bytes: usize, max_lines: usize) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max_bytes];
+    let bytes_read = file.read(&mut buf)?;
+    buf.truncate(bytes_read);
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut out = String::new();
+    for (idx, line) in text.lines().take(max_lines).enumerate() {
+        if idx > 0 {
+            out.push('\n');
         }
+        out.push_str(line);
     }
 
-    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    dirs.extend(files);
-
-    FileTreeSnapshot {
-        tab_id,
-        current_dir,
-        entries: dirs,
-    }
+    Ok(out)
 }
 
 fn add_word_diffs_to_lines(diff_lines: &mut [DiffLine]) {
@@ -2254,158 +3052,29 @@ fn collect_diff(
     file_path: String,
     is_staged: bool,
 ) -> DiffSnapshot {
-    let mut lines = Vec::new();
-    let Ok(repo) = Repository::open(&repo_path) else {
-        return DiffSnapshot {
-            tab_id,
-            file_path,
-            is_staged,
-            lines,
-        };
-    };
-
-    let is_untracked = repo
-        .statuses(None)
-        .ok()
-        .map(|statuses| {
-            statuses.iter().any(|e| {
-                e.path() == Some(file_path.as_str()) && e.status().contains(Status::WT_NEW)
-            })
-        })
-        .unwrap_or(false);
-
-    if is_untracked {
-        let full_path = repo_path.join(&file_path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            lines.push(DiffLine {
-                content: format!("@@ -0,0 +1,{} @@ (new file)", content.lines().count()),
-                line_type: DiffLineType::Header,
-                old_line_num: None,
-                new_line_num: None,
-                inline_changes: None,
-            });
-            for (i, line) in content.lines().enumerate() {
-                lines.push(DiffLine {
-                    content: line.to_string(),
-                    line_type: DiffLineType::Addition,
-                    old_line_num: None,
-                    new_line_num: Some((i + 1) as u32),
-                    inline_changes: None,
-                });
-            }
-        }
-        return DiffSnapshot {
-            tab_id,
-            file_path,
-            is_staged,
-            lines,
-        };
-    }
-
-    let mut diff_opts = DiffOptions::new();
-    diff_opts.pathspec(&file_path);
-    let diff = if is_staged {
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
-    } else {
-        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
-    };
-
-    if let Ok(diff) = diff {
-        let _ = diff.print(git2::DiffFormat::Patch, |_delta, hunk, line| {
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end()
-                .to_string();
-            match line.origin() {
-                'H' => {
-                    if let Some(h) = hunk {
-                        lines.push(DiffLine {
-                            content: format!(
-                                "@@ -{},{} +{},{} @@",
-                                h.old_start(),
-                                h.old_lines(),
-                                h.new_start(),
-                                h.new_lines()
-                            ),
-                            line_type: DiffLineType::Header,
-                            old_line_num: None,
-                            new_line_num: None,
-                            inline_changes: None,
-                        });
-                    }
-                }
-                '+' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Addition,
-                    old_line_num: None,
-                    new_line_num: line.new_lineno(),
-                    inline_changes: None,
-                }),
-                '-' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Deletion,
-                    old_line_num: line.old_lineno(),
-                    new_line_num: None,
-                    inline_changes: None,
-                }),
-                ' ' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Context,
-                    old_line_num: line.old_lineno(),
-                    new_line_num: line.new_lineno(),
-                    inline_changes: None,
-                }),
-                _ => {}
-            }
-            true
-        });
-        add_word_diffs_to_lines(&mut lines);
-    }
-
-    DiffSnapshot {
-        tab_id,
-        file_path,
-        is_staged,
-        lines,
-    }
+    services::collect_diff(tab_id, repo_path, file_path, is_staged)
 }
 
 fn collect_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> FileLoadSnapshot {
-    let mut snapshot = FileLoadSnapshot {
+    services::collect_file_load(tab_id, path, is_dark_theme)
+}
+
+fn collect_file_syntax_highlight(
+    tab_id: usize,
+    path: PathBuf,
+    file_content: String,
+    is_dark_theme: bool,
+    file_signature: Option<FileVersionSignature>,
+    max_lines: usize,
+) -> FileSyntaxSnapshot {
+    services::collect_file_syntax_highlight(
         tab_id,
-        path: path.clone(),
-        file_content: String::new(),
-        image_path: None,
-        webview_content: None,
-    };
-
-    #[cfg(feature = "excalidraw")]
-    if excalidraw::is_excalidraw_file(&path) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if excalidraw::validate_excalidraw(&content) {
-                snapshot.webview_content =
-                    Some(excalidraw::render_excalidraw_html(&content, is_dark_theme));
-            }
-        }
-        return snapshot;
-    }
-
-    if TabState::is_markdown_file(&path) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            snapshot.webview_content =
-                Some(markdown::render_markdown_to_html(&content, is_dark_theme));
-        }
-    } else if TabState::is_html_file(&path) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            snapshot.webview_content = Some(content);
-        }
-    } else if TabState::is_image_file(&path) {
-        snapshot.image_path = Some(path);
-    } else if let Ok(content) = std::fs::read_to_string(&path) {
-        snapshot.file_content = content;
-    }
-
-    snapshot
+        path,
+        file_content,
+        is_dark_theme,
+        file_signature,
+        max_lines,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2433,6 +3102,7 @@ pub enum Event {
     OpenFileInBrowser,
     // Theme
     ToggleTheme,
+    ToggleLogServer,
     // Font size - Terminal
     IncreaseTerminalFont,
     DecreaseTerminalFont,
@@ -2487,6 +3157,13 @@ pub enum Event {
     // Claude tab
     NewClaudeTab,
     ResumeClaudeTab,
+    // Codex tab
+    NewCodexTab,
+    // Plain terminal tab (no startup command)
+    NewPlainTab,
+    // Tab picker popup
+    ShowTabPicker,
+    HideTabPicker,
     // Edit file in editor
     EditFile(PathBuf),
     // Claude sidebar events
@@ -2514,7 +3191,11 @@ pub enum Event {
     FileTreeLoaded(FileTreeSnapshot),
     DiffLoaded(DiffSnapshot),
     FileLoaded(FileLoadSnapshot),
+    FileViewScrolled(usize, scrollable::Viewport),
+    FileSyntaxHighlighted(FileSyntaxSnapshot),
     LogServerSyncComplete,
+    SyntectWarmupComplete,
+    LoadingUiTick,
     // Speech-to-text events
     #[cfg(feature = "stt")]
     SttToggle,
@@ -2539,6 +3220,7 @@ struct App {
     show_hidden: bool,
     window_size: (f32, f32),
     log_server_state: log_server::ServerState,
+    log_server_enabled: bool,
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
@@ -2560,14 +3242,18 @@ struct App {
     current_modifiers: Modifiers,
     // Help modal
     show_help: bool,
+    // Tab picker popup (Option+click on "+")
+    tab_picker_visible: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
     workspaces_dirty: bool,
     next_workspace_save_at: Option<Instant>,
     log_server_dirty: bool,
     next_log_server_sync_at: Instant,
+    next_perf_report_at: Instant,
     log_server_sync_in_flight: bool,
     log_server_sync_queued: bool,
+    last_log_server_snapshot_hash: Option<u64>,
     // Speech-to-text state
     #[cfg(feature = "stt")]
     stt_enabled: bool,
@@ -2603,6 +3289,10 @@ fn workspace_bar_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-bar-scroll")
 }
 
+fn file_view_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("file-view-scroll")
+}
+
 const ESTIMATED_TAB_WIDTH: f32 = 200.0;
 const ESTIMATED_WS_BTN_WIDTH: f32 = 180.0;
 
@@ -2611,6 +3301,13 @@ const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
 const WORKSPACES_SAVE_DEBOUNCE_MS: u64 = 1500;
 const LOG_SERVER_SYNC_INTERVAL_MS: u64 = 15000;
+const LOG_SERVER_STARTUP_RETRY_MS: u64 = 500;
+const MENU_POLL_INTERVAL_MS: u64 = 200;
+const GIT_POLL_FAST_INTERVAL_MS: u64 = 5000;
+const GIT_POLL_MEDIUM_INTERVAL_MS: u64 = 10000;
+const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
+const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
+const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 
 #[derive(Debug, Clone)]
 pub struct GitStatusSnapshot {
@@ -2637,6 +3334,8 @@ pub struct DiffSnapshot {
     file_path: String,
     is_staged: bool,
     lines: Vec<DiffLine>,
+    diff_syntax_lines: Option<Vec<Vec<SyntaxHighlightSegment>>>,
+    diff_syntax_notice: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2646,6 +3345,19 @@ pub struct FileLoadSnapshot {
     file_content: String,
     image_path: Option<PathBuf>,
     webview_content: Option<String>,
+    file_preview_notice: Option<String>,
+    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
+    syntax_highlight_notice: Option<String>,
+    file_signature: Option<FileVersionSignature>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileSyntaxSnapshot {
+    tab_id: usize,
+    path: PathBuf,
+    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
+    syntax_highlight_notice: Option<String>,
+    file_signature: Option<FileVersionSignature>,
 }
 
 impl App {
@@ -2657,6 +3369,32 @@ impl App {
     /// Small UI font size (for hints, secondary text)
     fn ui_font_small(&self) -> f32 {
         self.ui_font_size - 1.0
+    }
+
+    /// Ghost/pill button style — transparent bg, subtle border, rounded, hover tint.
+    /// Used for toolbar action buttons (Close, Open in Browser, Copy All, etc.)
+    fn ghost_button_style(&self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        let border_color = self.theme.overlay0();
+        let hover_bg = self.theme.bg_overlay();
+        let text_color = self.theme.text_primary();
+        let text_muted = self.theme.overlay1();
+        move |_theme, status| {
+            let (bg, tc) = match status {
+                button::Status::Hovered => (Some(hover_bg.into()), text_color),
+                button::Status::Pressed => (Some(hover_bg.into()), text_color),
+                _ => (None, text_muted),
+            };
+            button::Style {
+                background: bg,
+                text_color: tc,
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }
+        }
     }
 
     fn tab_uses_inline_webview(tab: &TabState) -> bool {
@@ -2692,6 +3430,55 @@ impl App {
                 None
             }
         })
+    }
+
+    fn maybe_report_perf(&mut self, now: Instant) {
+        if !perf_enabled() || now < self.next_perf_report_at {
+            return;
+        }
+
+        let mut tab_count = 0usize;
+        let mut viewing_files = 0usize;
+        let mut preview_notice_count = 0usize;
+        let mut file_content_bytes = 0usize;
+        let mut webview_html_bytes = 0usize;
+        let mut console_line_count = 0usize;
+        let mut console_bytes = 0usize;
+
+        for ws in &self.workspaces {
+            console_line_count += ws.console.output_lines.len();
+            console_bytes += ws
+                .console
+                .output_lines
+                .iter()
+                .map(|l| l.timestamp.len() + 1 + l.content.len())
+                .sum::<usize>();
+
+            for tab in &ws.tabs {
+                tab_count += 1;
+                if tab.viewing_file_path.is_some() {
+                    viewing_files += 1;
+                }
+                if tab.file_preview_notice.is_some() {
+                    preview_notice_count += 1;
+                }
+                file_content_bytes += tab.file_content.len();
+                webview_html_bytes += tab.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
+            }
+        }
+
+        perf_log!(
+            "mem tabs={} viewing_files={} file_bytes={}KB webview_bytes={}KB console_bytes={}KB console_lines={} notices={}",
+            tab_count,
+            viewing_files,
+            file_content_bytes / 1024,
+            webview_html_bytes / 1024,
+            console_bytes / 1024,
+            console_line_count,
+            preview_notice_count
+        );
+
+        self.next_perf_report_at = now + Duration::from_millis(PERF_REPORT_INTERVAL_MS);
     }
 
     /// Focus the active main tab terminal (unfocusing bottom panel terminal)
@@ -2757,6 +3544,7 @@ impl App {
             show_hidden: self.show_hidden,
             console_height: self.console_height,
             console_expanded: self.console_expanded,
+            log_server_enabled: self.log_server_enabled,
             #[cfg(feature = "stt")]
             stt_enabled: self.stt_enabled,
             #[cfg(feature = "stt")]
@@ -2805,56 +3593,141 @@ impl App {
             Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
     }
 
+    fn start_log_server(&self) {
+        let server_state = self.log_server_state.clone();
+        tokio::spawn(async move {
+            log_server::start_server(server_state).await;
+        });
+    }
+
+    fn set_log_server_enabled(&mut self, enabled: bool) {
+        if self.log_server_enabled == enabled {
+            return;
+        }
+
+        self.log_server_enabled = enabled;
+
+        if enabled {
+            self.last_log_server_snapshot_hash = None;
+            self.log_server_dirty = true;
+            self.log_server_sync_queued = false;
+            self.next_log_server_sync_at = Instant::now();
+            self.start_log_server();
+        } else {
+            self.log_server_state.shutdown.notify_one();
+            if let Ok(mut port) = self.log_server_state.bound_port.lock() {
+                *port = None;
+            }
+            self.log_server_dirty = false;
+            self.log_server_sync_in_flight = false;
+            self.log_server_sync_queued = false;
+            self.last_log_server_snapshot_hash = None;
+        }
+
+        self.save_config();
+    }
+
     fn mark_log_server_dirty(&mut self) {
-        self.log_server_dirty = true;
+        if self.log_server_enabled {
+            self.log_server_dirty = true;
+        }
     }
 
     fn queue_log_server_sync(&mut self) -> Task<Event> {
-        if self.log_server_sync_in_flight {
-            self.log_server_sync_queued = true;
-            return Task::none();
-        }
-
-        // If the localhost log server is unavailable, skip expensive snapshot collection.
-        if self.log_server_state.base_url().is_none() {
+        if !self.log_server_enabled {
             self.log_server_dirty = false;
+            self.log_server_sync_queued = false;
             self.next_log_server_sync_at =
                 Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
             return Task::none();
         }
 
+        if self.log_server_sync_in_flight {
+            self.log_server_sync_queued = true;
+            return Task::none();
+        }
+
+        // If the localhost log server is still starting, retry soon.
+        if self.log_server_state.base_url().is_none() {
+            self.log_server_dirty = true;
+            self.next_log_server_sync_at =
+                Instant::now() + Duration::from_millis(LOG_SERVER_STARTUP_RETRY_MS);
+            return Task::none();
+        }
+
         self.log_server_dirty = false;
-        self.log_server_sync_in_flight = true;
         self.next_log_server_sync_at =
             Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
+        let started = Instant::now();
 
         let state = self.log_server_state.clone();
         let mut terminal_snapshots = std::collections::HashMap::new();
         let mut file_snapshots = std::collections::HashMap::new();
+        let mut terminal_bytes = 0usize;
+        let mut file_bytes = 0usize;
+        let mut snapshot_hasher = DefaultHasher::new();
 
         // Collect terminal content and file content from all tabs across all workspaces
         for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
+            tab.id.hash(&mut snapshot_hasher);
+
             if let Some(term) = &tab.terminal {
+                true.hash(&mut snapshot_hasher);
                 let content = term.get_all_text();
+                terminal_bytes += content.len();
+                tab.repo_name.hash(&mut snapshot_hasher);
+                content.hash(&mut snapshot_hasher);
                 let snapshot = log_server::TerminalSnapshot {
                     tab_id: tab.id,
                     tab_name: tab.repo_name.clone(),
                     content,
                 };
                 terminal_snapshots.insert(tab.id, snapshot);
+            } else {
+                false.hash(&mut snapshot_hasher);
             }
 
             // If tab is viewing a file, add it to file snapshots
             if let Some(file_path) = &tab.viewing_file_path {
                 if !tab.file_content.is_empty() {
+                    true.hash(&mut snapshot_hasher);
+                    file_bytes += tab.file_content.len();
+                    file_path.to_string_lossy().hash(&mut snapshot_hasher);
+                    tab.file_content.hash(&mut snapshot_hasher);
                     let snapshot = log_server::FileSnapshot {
                         file_path: file_path.to_string_lossy().to_string(),
                         content: tab.file_content.clone(),
                     };
                     file_snapshots.insert(tab.id, snapshot);
+                } else {
+                    false.hash(&mut snapshot_hasher);
                 }
+            } else {
+                false.hash(&mut snapshot_hasher);
             }
         }
+
+        let snapshot_hash = snapshot_hasher.finish();
+        if self.last_log_server_snapshot_hash == Some(snapshot_hash) {
+            perf_log!(
+                "log_sync skip unchanged terminals={} files={} collect_took={}ms",
+                terminal_snapshots.len(),
+                file_snapshots.len(),
+                started.elapsed().as_millis()
+            );
+            return Task::none();
+        }
+        self.last_log_server_snapshot_hash = Some(snapshot_hash);
+        self.log_server_sync_in_flight = true;
+
+        perf_log!(
+            "log_sync terminals={} files={} term_bytes={}KB file_bytes={}KB collect_took={}ms",
+            terminal_snapshots.len(),
+            file_snapshots.len(),
+            terminal_bytes / 1024,
+            file_bytes / 1024,
+            started.elapsed().as_millis()
+        );
 
         Task::perform(
             async move {
@@ -2890,6 +3763,15 @@ impl App {
         )
     }
 
+    fn request_syntect_warmup() -> Task<Event> {
+        Task::perform(
+            async {
+                let _ = tokio::task::spawn_blocking(warm_syntect_engine).await;
+            },
+            |_| Event::SyntectWarmupComplete,
+        )
+    }
+
     fn request_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> Task<Event> {
         let fallback_dir = current_dir.clone();
         Task::perform(
@@ -2916,22 +3798,41 @@ impl App {
         repo_path: PathBuf,
         file_path: String,
         staged: bool,
+        is_dark_theme: bool,
     ) -> Task<Event> {
+        let fallback_repo_path = repo_path.clone();
         let fallback_file_path = file_path.clone();
         Task::perform(
             async move {
                 match tokio::task::spawn_blocking(move || {
-                    collect_diff(tab_id, repo_path, file_path, staged)
+                    let mut snapshot = collect_diff(tab_id, repo_path, file_path, staged);
+                    let (syntax_lines, syntax_notice) = build_diff_syntax_highlight_lines_cached(
+                        &snapshot.file_path,
+                        snapshot.is_staged,
+                        &snapshot.lines,
+                        is_dark_theme,
+                    );
+                    snapshot.diff_syntax_lines = syntax_lines;
+                    snapshot.diff_syntax_notice = syntax_notice;
+                    snapshot
                 })
                 .await
                 {
                     Ok(snapshot) => snapshot,
-                    Err(_) => DiffSnapshot {
-                        tab_id,
-                        file_path: fallback_file_path,
-                        is_staged: staged,
-                        lines: Vec::new(),
-                    },
+                    Err(_) => {
+                        let mut snapshot =
+                            collect_diff(tab_id, fallback_repo_path, fallback_file_path, staged);
+                        let (syntax_lines, syntax_notice) =
+                            build_diff_syntax_highlight_lines_cached(
+                                &snapshot.file_path,
+                                snapshot.is_staged,
+                                &snapshot.lines,
+                                is_dark_theme,
+                            );
+                        snapshot.diff_syntax_lines = syntax_lines;
+                        snapshot.diff_syntax_notice = syntax_notice;
+                        snapshot
+                    }
                 }
             },
             Event::DiffLoaded,
@@ -2954,10 +3855,51 @@ impl App {
                         file_content: String::new(),
                         image_path: None,
                         webview_content: None,
+                        file_preview_notice: None,
+                        syntax_highlight_lines: None,
+                        syntax_highlight_notice: None,
+                        file_signature: None,
                     },
                 }
             },
             Event::FileLoaded,
+        )
+    }
+
+    fn request_file_syntax_highlight(
+        tab_id: usize,
+        path: PathBuf,
+        file_content: String,
+        is_dark_theme: bool,
+        file_signature: Option<FileVersionSignature>,
+        max_lines: usize,
+    ) -> Task<Event> {
+        let fallback_path = path.clone();
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    collect_file_syntax_highlight(
+                        tab_id,
+                        path,
+                        file_content,
+                        is_dark_theme,
+                        file_signature,
+                        max_lines,
+                    )
+                })
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => FileSyntaxSnapshot {
+                        tab_id,
+                        path: fallback_path,
+                        syntax_highlight_lines: None,
+                        syntax_highlight_notice: None,
+                        file_signature: None,
+                    },
+                }
+            },
+            Event::FileSyntaxHighlighted,
         )
     }
 }
@@ -2979,15 +3921,10 @@ impl App {
         } else {
             (config.terminal_font_size, config.ui_font_size)
         };
+        let log_server_enabled = config.log_server_enabled;
 
         // Initialize log server state
         let log_server_state = log_server::ServerState::new();
-
-        // Start the HTTP log server in the background
-        let server_state = log_server_state.clone();
-        tokio::spawn(async move {
-            log_server::start_server(server_state).await;
-        });
 
         let mut app = Self {
             title: String::from("GitTerm"),
@@ -3004,6 +3941,7 @@ impl App {
             show_hidden: config.show_hidden,
             window_size: (1400.0, 800.0), // Initial size, updated on resize
             log_server_state,
+            log_server_enabled,
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
@@ -3019,13 +3957,16 @@ impl App {
             attention_pulse_bright: false,
             current_modifiers: Modifiers::empty(),
             show_help: false,
+            tab_picker_visible: false,
             bottom_panel_focused: false,
             workspaces_dirty: false,
             next_workspace_save_at: None,
-            log_server_dirty: true,
+            log_server_dirty: log_server_enabled,
             next_log_server_sync_at: Instant::now(),
+            next_perf_report_at: Instant::now() + Duration::from_millis(PERF_REPORT_INTERVAL_MS),
             log_server_sync_in_flight: false,
             log_server_sync_queued: false,
+            last_log_server_snapshot_hash: None,
             // Speech-to-text
             #[cfg(feature = "stt")]
             stt_enabled: config.stt_enabled,
@@ -3122,14 +4063,31 @@ impl App {
             app.workspaces.push(workspace);
         }
 
+        if app.log_server_enabled {
+            app.start_log_server();
+        }
+
         // Set initial slide position for active workspace
         let viewport_width = app.content_viewport_width();
         let initial_offset = app.active_workspace_idx as f32 * viewport_width;
         app.slide_offset = initial_offset;
         app.slide_target = initial_offset;
 
-        // Return a task to initialize the menu bar after the app starts
-        (app, Task::done(Event::InitMenu))
+        // Return startup tasks (menu init + initial git status for active tab)
+        let mut startup_tasks = vec![Task::done(Event::InitMenu), Self::request_syntect_warmup()];
+        if let Some((tab_id, repo_path)) = {
+            if let Some(tab) = app.active_tab_mut() {
+                tab.git_status_loading = true;
+                tab.last_poll = Instant::now();
+                Some((tab.id, tab.repo_path.clone()))
+            } else {
+                None
+            }
+        } {
+            startup_tasks.push(Self::request_git_status(tab_id, repo_path));
+        }
+
+        (app, Task::batch(startup_tasks))
     }
 
     fn add_tab_to_workspace(&mut self, workspace: &mut Workspace, repo_path: PathBuf) {
@@ -3416,7 +4374,8 @@ fi
         let mut subs = vec![
             iced::time::every(Duration::from_millis(5000)).map(|_| Event::Tick),
             // Poll menu events frequently
-            iced::time::every(Duration::from_millis(50)).map(|_| Event::CheckMenu),
+            iced::time::every(Duration::from_millis(MENU_POLL_INTERVAL_MS))
+                .map(|_| Event::CheckMenu),
             iced::event::listen_with(|event, _status, _id| match event {
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                     Some(Event::ModifiersChanged(modifiers))
@@ -3456,6 +4415,16 @@ fi
             subs.push(
                 iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
             );
+        }
+
+        // Keep UI responsive for delayed loading indicators.
+        let loading_in_progress = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .any(|tab| tab.file_load_in_progress || tab.diff_load_in_progress);
+        if loading_in_progress {
+            subs.push(iced::time::every(Duration::from_millis(50)).map(|_| Event::LoadingUiTick));
         }
 
         for ws in &self.workspaces {
@@ -3577,7 +4546,12 @@ fi
                                                         .file_name()
                                                         .map(|n| n.to_string_lossy().to_string())
                                                         .unwrap_or_else(|| "repo".to_string());
+                                                    tab.git_poll_interval_ms =
+                                                        GIT_POLL_FAST_INTERVAL_MS;
+                                                    tab.git_unchanged_streak = 0;
+                                                    tab.last_git_status_hash = None;
                                                     tab.last_poll = Instant::now();
+                                                    tab.git_status_loading = true;
                                                     let status_task = Self::request_git_status(
                                                         tab.id,
                                                         tab.repo_path.clone(),
@@ -3612,7 +4586,7 @@ fi
                 let mut tasks: Vec<Task<Event>> = Vec::new();
                 let mut workspace_dirty = false;
 
-                // Poll git status every 5 seconds for the active tab (off UI thread)
+                // Poll git status for the active tab with adaptive cadence.
                 if let Some(tab) = self.active_tab_mut() {
                     // Self-heal repo root for restored sessions that may have persisted a subdir.
                     if let Ok(repo) = Repository::discover(&tab.current_dir) {
@@ -3625,15 +4599,30 @@ fi
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "repo".to_string());
+                                tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                                tab.git_unchanged_streak = 0;
+                                tab.last_git_status_hash = None;
                                 workspace_dirty = true;
                             }
                         }
                     }
 
-                    if tab.last_poll.elapsed() >= Duration::from_millis(5000) {
+                    let git_focus_active =
+                        tab.sidebar_mode == SidebarMode::Git || tab.selected_file.is_some();
+                    let effective_git_poll_interval_ms = if git_focus_active {
+                        tab.git_poll_interval_ms
+                    } else {
+                        tab.git_poll_interval_ms.max(GIT_POLL_SLOW_INTERVAL_MS)
+                    };
+
+                    if !tab.git_status_loading
+                        && tab.last_poll.elapsed()
+                            >= Duration::from_millis(effective_git_poll_interval_ms)
+                    {
                         let tab_id = tab.id;
                         let repo_path = tab.repo_path.clone();
                         tab.last_poll = Instant::now();
+                        tab.git_status_loading = true;
                         tasks.push(Self::request_git_status(tab_id, repo_path));
                     }
                 }
@@ -3643,10 +4632,7 @@ fi
 
                 // Debounced workspace persistence
                 let now = Instant::now();
-                // Keep log snapshots fresh on interval only when the local server is active.
-                if self.log_server_state.base_url().is_some() {
-                    self.log_server_dirty = true;
-                }
+                self.maybe_report_perf(now);
                 if self.workspaces_dirty
                     && self
                         .next_workspace_save_at
@@ -3684,6 +4670,8 @@ fi
                             return self.update(Event::DecreaseUiFont);
                         } else if event.id == ids.toggle_theme {
                             return self.update(Event::ToggleTheme);
+                        } else if event.id == ids.toggle_log_server {
+                            return self.update(Event::ToggleLogServer);
                         } else if event.id == ids.clear_terminal {
                             return self.update(Event::ClearTerminal);
                         }
@@ -3776,22 +4764,35 @@ fi
                 return self.scroll_to_active_tab();
             }
             Event::NewClaudeTab => {
-                // Create a new tab that auto-launches Claude Code
-                if let Some(ws) = self.active_workspace() {
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    self.add_tab_with_command(dir, Some("claude".to_string()));
-                    self.mark_workspaces_dirty();
-                    self.mark_log_server_dirty();
-                    if let Some(tab) = self.active_tab() {
-                        return Task::batch([
-                            self.scroll_to_active_tab(),
-                            Self::request_git_status(tab.id, tab.repo_path.clone()),
-                        ]);
+                // Option+click on "+" shows tab picker (but not if picker is already open)
+                if self.current_modifiers.alt() && !self.tab_picker_visible {
+                    self.tab_picker_visible = true;
+                } else {
+                    // Create a new tab that auto-launches Claude Code
+                    self.tab_picker_visible = false;
+                    if let Some(ws) = self.active_workspace() {
+                        let dir = ws
+                            .active_tab()
+                            .map(|t| t.current_dir.clone())
+                            .unwrap_or_else(|| ws.dir.clone());
+                        self.add_tab_with_command(dir, Some("claude".to_string()));
+                        self.mark_workspaces_dirty();
+                        self.mark_log_server_dirty();
+                        if let Some((tab_id, repo_path)) = {
+                            if let Some(tab) = self.active_tab_mut() {
+                                tab.git_status_loading = true;
+                                Some((tab.id, tab.repo_path.clone()))
+                            } else {
+                                None
+                            }
+                        } {
+                            return Task::batch([
+                                self.scroll_to_active_tab(),
+                                Self::request_git_status(tab_id, repo_path),
+                            ]);
+                        }
+                        return self.scroll_to_active_tab();
                     }
-                    return self.scroll_to_active_tab();
                 }
             }
             Event::ResumeClaudeTab => {
@@ -3804,14 +4805,81 @@ fi
                     self.add_tab_with_command(dir, Some("claude --resume".to_string()));
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
-                    if let Some(tab) = self.active_tab() {
+                    if let Some((tab_id, repo_path)) = {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.git_status_loading = true;
+                            Some((tab.id, tab.repo_path.clone()))
+                        } else {
+                            None
+                        }
+                    } {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            Self::request_git_status(tab.id, tab.repo_path.clone()),
+                            Self::request_git_status(tab_id, repo_path),
                         ]);
                     }
                     return self.scroll_to_active_tab();
                 }
+            }
+            Event::NewCodexTab => {
+                // Create a new tab that auto-launches Codex
+                self.tab_picker_visible = false;
+                if let Some(ws) = self.active_workspace() {
+                    let dir = ws
+                        .active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    self.add_tab_with_command(dir, Some("codex resume".to_string()));
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                    if let Some((tab_id, repo_path)) = {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.git_status_loading = true;
+                            Some((tab.id, tab.repo_path.clone()))
+                        } else {
+                            None
+                        }
+                    } {
+                        return Task::batch([
+                            self.scroll_to_active_tab(),
+                            Self::request_git_status(tab_id, repo_path),
+                        ]);
+                    }
+                    return self.scroll_to_active_tab();
+                }
+            }
+            Event::NewPlainTab => {
+                // Create a plain terminal tab (no startup command)
+                self.tab_picker_visible = false;
+                if let Some(ws) = self.active_workspace() {
+                    let dir = ws
+                        .active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    self.add_tab_with_command(dir, None);
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                    if let Some((tab_id, repo_path)) = {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.git_status_loading = true;
+                            Some((tab.id, tab.repo_path.clone()))
+                        } else {
+                            None
+                        }
+                    } {
+                        return Task::batch([
+                            self.scroll_to_active_tab(),
+                            Self::request_git_status(tab_id, repo_path),
+                        ]);
+                    }
+                    return self.scroll_to_active_tab();
+                }
+            }
+            Event::ShowTabPicker => {
+                self.tab_picker_visible = true;
+            }
+            Event::HideTabPicker => {
+                self.tab_picker_visible = false;
             }
             Event::EditFile(path) => {
                 // Open a file in $EDITOR (fallback: vim) in a new tab
@@ -3825,10 +4893,17 @@ fi
                     self.add_tab_with_command(dir, Some(cmd));
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
-                    if let Some(tab) = self.active_tab() {
+                    if let Some((tab_id, repo_path)) = {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.git_status_loading = true;
+                            Some((tab.id, tab.repo_path.clone()))
+                        } else {
+                            None
+                        }
+                    } {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            Self::request_git_status(tab.id, tab.repo_path.clone()),
+                            Self::request_git_status(tab_id, repo_path),
                         ]);
                     }
                     return self.scroll_to_active_tab();
@@ -3952,10 +5027,17 @@ fi
                 self.add_tab(path);
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
-                if let Some(tab) = self.active_tab() {
+                if let Some((tab_id, repo_path)) = {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_status_loading = true;
+                        Some((tab.id, tab.repo_path.clone()))
+                    } else {
+                        None
+                    }
+                } {
                     return Task::batch([
                         self.scroll_to_active_tab(),
-                        Self::request_git_status(tab.id, tab.repo_path.clone()),
+                        Self::request_git_status(tab_id, repo_path),
                     ]);
                 }
                 return self.scroll_to_active_tab();
@@ -3964,13 +5046,28 @@ fi
             Event::FileSelect(path, is_staged) => {
                 // Hide WebView when switching to git diff view
                 webview::set_visible(false);
+                let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
+                    if tab.selected_file.as_deref() == Some(path.as_str())
+                        && tab.selected_is_staged == is_staged
+                        && (tab.diff_load_in_progress || !tab.diff_lines.is_empty())
+                    {
+                        return Task::none();
+                    }
+
                     // Clear file viewer if open
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
                     tab.image_handle = None;
                     tab.webview_content = None;
+                    tab.file_preview_notice = None;
+                    tab.syntax_highlight_lines = None;
+                    tab.syntax_highlight_notice = None;
+                    tab.syntax_highlight_in_progress = false;
+                    tab.syntax_highlight_requested_lines = 0;
+                    tab.file_load_in_progress = false;
+                    tab.file_load_started_at = None;
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -3978,15 +5075,20 @@ fi
                     }
                     tab.selected_file = Some(path.clone());
                     tab.selected_is_staged = is_staged;
+                    tab.diff_load_in_progress = true;
+                    tab.diff_load_started_at = Some(Instant::now());
+                    tab.diff_syntax_lines = None;
+                    tab.diff_syntax_notice = None;
                     let tab_id = tab.id;
                     let repo_path = tab.repo_path.clone();
                     self.mark_log_server_dirty();
-                    return Self::request_diff(tab_id, repo_path, path, is_staged);
+                    return Self::request_diff(tab_id, repo_path, path, is_staged, is_dark_theme);
                 }
             }
             Event::FileSelectByIndex(idx) => {
                 // Hide WebView when switching to git diff view
                 webview::set_visible(false);
+                let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear file viewer if open
@@ -3994,6 +5096,13 @@ fi
                     tab.file_content.clear();
                     tab.image_handle = None;
                     tab.webview_content = None;
+                    tab.file_preview_notice = None;
+                    tab.syntax_highlight_lines = None;
+                    tab.syntax_highlight_notice = None;
+                    tab.syntax_highlight_in_progress = false;
+                    tab.syntax_highlight_requested_lines = 0;
+                    tab.file_load_in_progress = false;
+                    tab.file_load_started_at = None;
 
                     let total = tab.total_changes() as i32;
                     if total == 0 {
@@ -4007,12 +5116,28 @@ fi
                     if let Some(file) = all_files.get(new_idx as usize) {
                         let path = file.path.clone();
                         let is_staged = file.is_staged;
+                        if tab.selected_file.as_deref() == Some(path.as_str())
+                            && tab.selected_is_staged == is_staged
+                            && (tab.diff_load_in_progress || !tab.diff_lines.is_empty())
+                        {
+                            return Task::none();
+                        }
                         tab.selected_file = Some(path.clone());
                         tab.selected_is_staged = is_staged;
+                        tab.diff_load_in_progress = true;
+                        tab.diff_load_started_at = Some(Instant::now());
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
                         let tab_id = tab.id;
                         let repo_path = tab.repo_path.clone();
                         self.mark_log_server_dirty();
-                        return Self::request_diff(tab_id, repo_path, path, is_staged);
+                        return Self::request_diff(
+                            tab_id,
+                            repo_path,
+                            path,
+                            is_staged,
+                            is_dark_theme,
+                        );
                     }
                 }
             }
@@ -4021,10 +5146,22 @@ fi
                     tab.selected_file = None;
                     tab.file_index = -1;
                     tab.diff_lines.clear();
+                    tab.diff_load_in_progress = false;
+                    tab.diff_load_started_at = None;
+                    tab.diff_syntax_lines = None;
+                    tab.diff_syntax_notice = None;
                 }
             }
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
+
+                // Tab picker: Escape closes
+                if self.tab_picker_visible {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        self.tab_picker_visible = false;
+                        return Task::none();
+                    }
+                }
 
                 // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
                 if self.show_help {
@@ -4192,6 +5329,7 @@ fi
 
                 // Option+Shift+C — resume Claude Code session
                 // Option+Shift+T — new plain terminal tab (folder picker)
+                // Option+Shift+X — new Codex tab
                 if modifiers.alt() && modifiers.shift() {
                     if let Key::Character(c) = key.as_ref() {
                         if c == "c" || c == "C" {
@@ -4199,6 +5337,9 @@ fi
                         }
                         if c == "t" || c == "T" {
                             return Task::done(Event::OpenFolder);
+                        }
+                        if c == "x" || c == "X" {
+                            return Task::done(Event::NewCodexTab);
                         }
                     }
                 }
@@ -4265,7 +5406,17 @@ fi
                                 tab.file_content.clear();
                                 tab.image_handle = None;
                                 tab.webview_content = None;
+                                tab.file_preview_notice = None;
+                                tab.syntax_highlight_lines = None;
+                                tab.syntax_highlight_notice = None;
+                                tab.syntax_highlight_in_progress = false;
+                                tab.syntax_highlight_requested_lines = 0;
+                                tab.file_load_in_progress = false;
+                                tab.file_load_started_at = None;
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
                                 tab.last_poll = Instant::now();
+                                tab.git_status_loading = true;
                                 let tab_id = tab.id;
                                 let repo_path = tab.repo_path.clone();
                                 tab.sidebar_mode = mode;
@@ -4276,6 +5427,10 @@ fi
                                 // Switching to Files mode - clear git selection
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
                                 let tab_id = tab.id;
                                 let current_dir = tab.current_dir.clone();
                                 tab.sidebar_mode = mode;
@@ -4291,8 +5446,19 @@ fi
                                 tab.file_content.clear();
                                 tab.image_handle = None;
                                 tab.webview_content = None;
+                                tab.file_preview_notice = None;
+                                tab.syntax_highlight_lines = None;
+                                tab.syntax_highlight_notice = None;
+                                tab.syntax_highlight_in_progress = false;
+                                tab.syntax_highlight_requested_lines = 0;
+                                tab.file_load_in_progress = false;
+                                tab.file_load_started_at = None;
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
                                 tab.fetch_claude_config();
                             }
                         }
@@ -4458,13 +5624,50 @@ fi
                 }
 
                 if let Some(tab) = self.active_tab_mut() {
+                    let requested_signature = file_version_signature(&path);
+                    if tab.last_view_file_request_path.as_ref() == Some(&path)
+                        && tab
+                            .last_view_file_request_at
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(350))
+                    {
+                        return Task::none();
+                    }
+                    if tab.viewing_file_path.as_ref() == Some(&path) && tab.file_load_in_progress {
+                        return Task::none();
+                    }
+                    if tab.viewing_file_path.as_ref() == Some(&path)
+                        && !tab.file_load_in_progress
+                        && requested_signature.is_some()
+                        && tab.loaded_file_signature == requested_signature
+                    {
+                        perf_log!(
+                            "file_load skip_unchanged tab={} path={}",
+                            tab.id,
+                            path.display()
+                        );
+                        return Task::none();
+                    }
+
                     // Clear git selection if any
                     tab.selected_file = None;
                     tab.diff_lines.clear();
+                    tab.diff_load_in_progress = false;
+                    tab.diff_load_started_at = None;
+                    tab.diff_syntax_lines = None;
+                    tab.diff_syntax_notice = None;
                     tab.viewing_file_path = Some(path.clone());
                     tab.file_content.clear();
                     tab.image_handle = None;
                     tab.webview_content = None;
+                    tab.file_preview_notice = None;
+                    tab.syntax_highlight_lines = None;
+                    tab.syntax_highlight_notice = None;
+                    tab.syntax_highlight_in_progress = false;
+                    tab.syntax_highlight_requested_lines = 0;
+                    tab.file_load_in_progress = true;
+                    tab.file_load_started_at = Some(Instant::now());
+                    tab.last_view_file_request_path = Some(path.clone());
+                    tab.last_view_file_request_at = Some(Instant::now());
                     request = Some((tab.id, path));
                 }
                 if let Some((tab_id, file_path)) = request {
@@ -4483,6 +5686,13 @@ fi
                     tab.file_content.clear();
                     tab.image_handle = None;
                     tab.webview_content = None;
+                    tab.file_preview_notice = None;
+                    tab.syntax_highlight_lines = None;
+                    tab.syntax_highlight_notice = None;
+                    tab.syntax_highlight_in_progress = false;
+                    tab.syntax_highlight_requested_lines = 0;
+                    tab.file_load_in_progress = false;
+                    tab.file_load_started_at = None;
                 }
                 self.mark_log_server_dirty();
             }
@@ -4509,18 +5719,34 @@ fi
                 self.save_config();
                 self.recreate_terminals();
 
-                // Re-render markdown/excalidraw if viewing one
+                // Re-render current non-image file or active diff so theme-sensitive colors refresh.
                 let is_dark = self.theme == AppTheme::Dark;
                 if let Some(tab) = self.active_tab_mut() {
-                    if let Some(path) = &tab.viewing_file_path.clone() {
-                        let needs_reload = TabState::is_markdown_file(path);
-                        #[cfg(feature = "excalidraw")]
-                        let needs_reload = needs_reload || excalidraw::is_excalidraw_file(path);
-                        if needs_reload {
-                            return Self::request_file_load(tab.id, path.clone(), is_dark);
+                    if let Some(path) = tab.selected_file.clone() {
+                        tab.diff_load_in_progress = true;
+                        tab.diff_load_started_at = Some(Instant::now());
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        return Self::request_diff(
+                            tab.id,
+                            tab.repo_path.clone(),
+                            path,
+                            tab.selected_is_staged,
+                            is_dark,
+                        );
+                    }
+                    if let Some(path) = tab.viewing_file_path.clone() {
+                        if !TabState::is_image_file(&path) {
+                            tab.file_load_in_progress = true;
+                            tab.file_load_started_at = Some(Instant::now());
+                            return Self::request_file_load(tab.id, path, is_dark);
                         }
                     }
                 }
+            }
+            Event::ToggleLogServer => {
+                let enabled = !self.log_server_enabled;
+                self.set_log_server_enabled(enabled);
             }
             Event::IncreaseTerminalFont => {
                 let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
@@ -4632,7 +5858,39 @@ fi
             Event::OpenMarkdownInBrowser => {
                 // Write HTML to temp file and open in browser
                 if let Some(tab) = self.active_tab() {
-                    if let Some(html) = &tab.webview_content {
+                    let mut html_to_open = tab.webview_content.clone();
+
+                    if html_to_open.is_none() {
+                        if let Some(path) = tab.viewing_file_path.as_ref() {
+                            if TabState::is_markdown_file(path) {
+                                if let Ok(content) = std::fs::read_to_string(path) {
+                                    html_to_open = Some(markdown::render_markdown_to_html(
+                                        &content,
+                                        self.theme == AppTheme::Dark,
+                                    ));
+                                }
+                            } else if TabState::is_html_file(path) {
+                                if let Ok(content) = std::fs::read_to_string(path) {
+                                    html_to_open = Some(content);
+                                }
+                            } else {
+                                #[cfg(feature = "excalidraw")]
+                                if excalidraw::is_excalidraw_file(path) {
+                                    if let Ok(content) = std::fs::read_to_string(path) {
+                                        if excalidraw::validate_excalidraw(&content) {
+                                            html_to_open =
+                                                Some(excalidraw::render_excalidraw_html(
+                                                    &content,
+                                                    self.theme == AppTheme::Dark,
+                                                ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(html) = &html_to_open {
                         let temp_dir = std::env::temp_dir();
                         let file_name = tab
                             .viewing_file_path
@@ -4661,6 +5919,22 @@ fi
                                     .arg(&temp_path)
                                     .spawn();
                             }
+                        }
+                    } else if let Some(path) = tab.viewing_file_path.as_ref() {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = std::process::Command::new("open").arg(path).spawn();
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "start", ""])
+                                .arg(path)
+                                .spawn();
                         }
                     }
                 }
@@ -4724,6 +5998,7 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
+                    tab.git_status_loading = false;
                     if tab.repo_path == snapshot.repo_path {
                         // Guard against transient false negatives from background tasks:
                         // if discover() succeeds for the current path, keep git state.
@@ -4744,6 +6019,33 @@ fi
                         } else {
                             tab.is_git_repo = true;
                         }
+
+                        let effective_hash = git_tab_state_hash(tab);
+                        let unchanged = tab.last_git_status_hash == Some(effective_hash);
+                        if unchanged {
+                            tab.git_unchanged_streak = tab.git_unchanged_streak.saturating_add(1);
+                        } else {
+                            tab.git_unchanged_streak = 0;
+                        }
+
+                        let has_changes = !tab.staged.is_empty()
+                            || !tab.unstaged.is_empty()
+                            || !tab.untracked.is_empty();
+                        tab.git_poll_interval_ms = next_git_poll_interval_ms(
+                            tab.is_git_repo,
+                            has_changes,
+                            tab.git_unchanged_streak,
+                        );
+                        tab.last_git_status_hash = Some(effective_hash);
+
+                        perf_log!(
+                            "git_poll tab={} interval={}ms unchanged={} streak={} changes={}",
+                            tab.id,
+                            tab.git_poll_interval_ms,
+                            unchanged,
+                            tab.git_unchanged_streak,
+                            tab.staged.len() + tab.unstaged.len() + tab.untracked.len()
+                        );
 
                         tab.last_poll = Instant::now();
                     }
@@ -4771,7 +6073,11 @@ fi
                     if tab.selected_file.as_deref() == Some(snapshot.file_path.as_str())
                         && tab.selected_is_staged == snapshot.is_staged
                     {
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
                         tab.diff_lines = snapshot.lines;
+                        tab.diff_syntax_lines = snapshot.diff_syntax_lines;
+                        tab.diff_syntax_notice = snapshot.diff_syntax_notice;
                     }
                 }
             }
@@ -4779,6 +6085,13 @@ fi
                 // Extract WebView HTML before mutable borrow is released
                 let mut inline_webview_html: Option<String> = None;
                 let mut hide_webview = false;
+                let mut syntax_request: Option<(
+                    usize,
+                    PathBuf,
+                    String,
+                    Option<FileVersionSignature>,
+                    usize,
+                )> = None;
 
                 if let Some(tab) = self
                     .workspaces
@@ -4787,8 +6100,21 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     if tab.viewing_file_path.as_ref() == Some(&snapshot.path) {
+                        let loaded_path = snapshot.path.clone();
+                        let loaded_signature = snapshot.file_signature;
+                        tab.file_load_in_progress = false;
                         tab.file_content = snapshot.file_content;
                         tab.webview_content = snapshot.webview_content;
+                        tab.file_preview_notice = snapshot.file_preview_notice;
+                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                        tab.syntax_highlight_in_progress = false;
+                        tab.syntax_highlight_requested_lines = tab
+                            .syntax_highlight_lines
+                            .as_ref()
+                            .map(|lines| lines.len())
+                            .unwrap_or(0);
+                        tab.loaded_file_signature = loaded_signature;
                         tab.image_handle =
                             snapshot.image_path.as_ref().map(image::Handle::from_path);
 
@@ -4823,6 +6149,44 @@ fi
                         } else {
                             hide_webview = true;
                         }
+
+                        #[cfg(feature = "excalidraw")]
+                        let is_excalidraw_file = excalidraw::is_excalidraw_file(&loaded_path);
+                        #[cfg(not(feature = "excalidraw"))]
+                        let is_excalidraw_file = false;
+
+                        let is_text_syntax_candidate = tab.webview_content.is_none()
+                            && tab.image_handle.is_none()
+                            && !tab.file_content.is_empty()
+                            && !TabState::is_markdown_file(&loaded_path)
+                            && !TabState::is_html_file(&loaded_path)
+                            && !is_excalidraw_file;
+                        let mut waiting_for_initial_syntax = false;
+
+                        if is_text_syntax_candidate {
+                            let total_lines = tab
+                                .file_content
+                                .lines()
+                                .count()
+                                .min(MAX_FILE_VIEW_RENDER_LINES);
+                            let requested_lines = FILE_SYNTAX_INITIAL_LINES.min(total_lines);
+                            if requested_lines > 0 {
+                                tab.syntax_highlight_in_progress = true;
+                                tab.syntax_highlight_requested_lines = requested_lines;
+                                waiting_for_initial_syntax = true;
+                                syntax_request = Some((
+                                    tab.id,
+                                    loaded_path,
+                                    tab.file_content.clone(),
+                                    loaded_signature,
+                                    requested_lines,
+                                ));
+                            }
+                        }
+
+                        if !waiting_for_initial_syntax {
+                            tab.file_load_started_at = None;
+                        }
                     }
                 }
 
@@ -4838,6 +6202,102 @@ fi
                 }
 
                 self.mark_log_server_dirty();
+                if let Some((tab_id, path, file_content, file_signature, requested_lines)) =
+                    syntax_request
+                {
+                    return Self::request_file_syntax_highlight(
+                        tab_id,
+                        path,
+                        file_content,
+                        self.theme == AppTheme::Dark,
+                        file_signature,
+                        requested_lines,
+                    );
+                }
+            }
+            Event::FileViewScrolled(tab_id, viewport) => {
+                let is_dark_theme = self.theme == AppTheme::Dark;
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                {
+                    if tab.file_load_in_progress
+                        || tab.syntax_highlight_in_progress
+                        || tab.webview_content.is_some()
+                        || tab.image_handle.is_some()
+                        || tab.file_content.is_empty()
+                    {
+                        return Task::none();
+                    }
+
+                    let current_lines = tab
+                        .syntax_highlight_lines
+                        .as_ref()
+                        .map(|lines| lines.len())
+                        .unwrap_or(0);
+                    let total_lines = tab
+                        .file_content
+                        .lines()
+                        .count()
+                        .min(MAX_FILE_VIEW_RENDER_LINES);
+                    if current_lines >= total_lines {
+                        return Task::none();
+                    }
+
+                    let offset_y = viewport.absolute_offset().y.max(0.0);
+                    let visible_start_line = (offset_y / FILE_VIEW_LINE_HEIGHT_ESTIMATE) as usize;
+                    let requested_lines = (visible_start_line + FILE_SYNTAX_SCROLL_PREFETCH_LINES)
+                        .max(FILE_SYNTAX_INITIAL_LINES)
+                        .min(total_lines);
+
+                    if requested_lines <= current_lines
+                        || requested_lines <= tab.syntax_highlight_requested_lines
+                    {
+                        return Task::none();
+                    }
+
+                    tab.syntax_highlight_in_progress = true;
+                    tab.syntax_highlight_requested_lines = requested_lines;
+                    let Some(view_path) = tab.viewing_file_path.clone() else {
+                        tab.syntax_highlight_in_progress = false;
+                        return Task::none();
+                    };
+                    return Self::request_file_syntax_highlight(
+                        tab.id,
+                        view_path,
+                        tab.file_content.clone(),
+                        is_dark_theme,
+                        tab.loaded_file_signature,
+                        requested_lines,
+                    );
+                }
+            }
+            Event::FileSyntaxHighlighted(snapshot) => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == snapshot.tab_id)
+                {
+                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path)
+                        && tab.loaded_file_signature == snapshot.file_signature
+                    {
+                        tab.syntax_highlight_in_progress = false;
+                        tab.file_load_started_at = None;
+                        tab.syntax_highlight_requested_lines =
+                            tab.syntax_highlight_requested_lines.max(
+                                snapshot
+                                    .syntax_highlight_lines
+                                    .as_ref()
+                                    .map(|lines| lines.len())
+                                    .unwrap_or(0),
+                            );
+                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                    }
+                }
             }
             Event::LogServerSyncComplete => {
                 self.log_server_sync_in_flight = false;
@@ -4849,6 +6309,8 @@ fi
                     return self.queue_log_server_sync();
                 }
             }
+            Event::SyntectWarmupComplete => {}
+            Event::LoadingUiTick => {}
             #[cfg(feature = "stt")]
             Event::SttToggle => {
                 if !self.stt_enabled {
@@ -5141,8 +6603,15 @@ fi
                 self.slide_target = new_target;
                 self.slide_animating = false;
                 self.slide_start_time = None;
-                if let Some(tab) = self.active_tab() {
-                    return Self::request_git_status(tab.id, tab.repo_path.clone());
+                if let Some((tab_id, repo_path)) = {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_status_loading = true;
+                        Some((tab.id, tab.repo_path.clone()))
+                    } else {
+                        None
+                    }
+                } {
+                    return Self::request_git_status(tab_id, repo_path);
                 }
             }
             Event::WorkspaceCreated(None) => {}
@@ -5356,9 +6825,14 @@ fi
     /// Create or update the embedded WebView with HTML content.
     /// Uses iced::window::run to get the window handle for wry.
     fn show_webview(html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
-        eprintln!(
-            "show_webview: active={}, bounds=({}, {}, {}, {})",
-            webview::is_active(),
+        perf_log!(
+            "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
+            if webview::is_active() {
+                "reuse"
+            } else {
+                "create"
+            },
+            html.len(),
             bounds.0,
             bounds.1,
             bounds.2,
@@ -5377,7 +6851,7 @@ fi
             if let Some(id) = opt_id {
                 iced::window::run(id, |window| {
                     if let Err(e) = webview::try_create_with_window(window) {
-                        eprintln!("Failed to create WebView: {e}");
+                        perf_log!("webview_create_failed: {e}");
                     }
                 })
                 .discard()
@@ -5476,9 +6950,121 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.tab_picker_visible {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_tab_picker())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else {
             main_view
         }
+    }
+
+    fn view_tab_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_surface();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        let mono = iced::Font::with_name("Menlo");
+
+        let picker_row = |label: &'static str,
+                          desc: &'static str,
+                          icon: &'static str,
+                          event: Event|
+         -> Element<'_, Event, Theme, iced::Renderer> {
+            let hover = hover_bg;
+            button(
+                row![
+                    text(icon)
+                        .size(14)
+                        .color(text_secondary)
+                        .font(mono)
+                        .width(Length::Fixed(24.0)),
+                    column![
+                        text(label).size(13).color(text_primary),
+                        text(desc).size(11).color(text_secondary),
+                    ]
+                    .spacing(1)
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .padding([6, 10]),
+            )
+            .style(move |_theme, status| {
+                let bg_color = if matches!(status, button::Status::Hovered) {
+                    Some(hover.into())
+                } else {
+                    None
+                };
+                button::Style {
+                    background: bg_color,
+                    text_color: text_primary,
+                    border: iced::Border::default(),
+                    ..Default::default()
+                }
+            })
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(event)
+            .into()
+        };
+
+        let picker_menu = container(
+            column![
+                picker_row("Claude Code", "claude", "\u{276f}", Event::NewClaudeTab),
+                picker_row("Codex", "codex resume", "\u{2261}", Event::NewCodexTab),
+                picker_row("Terminal", "Plain shell", "\u{25b8}", Event::NewPlainTab),
+            ]
+            .spacing(0)
+            .width(Length::Fixed(200.0)),
+        )
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 8.0,
+            },
+            ..Default::default()
+        })
+        .padding(4);
+
+        // Click-away backdrop to dismiss
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::HideTabPicker);
+
+        // Position the picker near top-left (below tab bar area)
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(picker_menu)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Left)
+                    .align_y(iced::alignment::Vertical::Top)
+                    .padding(iced::Padding {
+                        top: 32.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 56.0,
+                    }),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_help_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -5543,7 +7129,12 @@ fi
         // Tabs
         content_col = content_col.push(section_header("Tabs"));
         content_col = content_col.push(shortcut_row("+ button", "New Claude tab"));
+        content_col = content_col.push(shortcut_row(
+            "Option + Click +",
+            "Tab picker (Claude/Codex/Terminal)",
+        ));
         content_col = content_col.push(shortcut_row("Option + Shift + C", "Resume Claude session"));
+        content_col = content_col.push(shortcut_row("Option + Shift + X", "New Codex tab"));
         content_col = content_col.push(shortcut_row("Option + Shift + T", "New terminal (folder)"));
 
         // Console
@@ -6034,7 +7625,8 @@ fi
                 ("▶ ", theme.success())
             };
 
-            // Tab label - strip leading "*" when attention (redundant with visual indicator), truncate at 20 chars
+            // Tab label - strip leading "*" when attention (redundant with visual indicator),
+            // shorten path-like titles to last component, truncate at 20 chars
             let base_title = tab
                 .terminal_title
                 .as_ref()
@@ -6044,10 +7636,19 @@ fi
                     } else {
                         t.as_str()
                     };
+                    // Path-like titles (e.g. from Codex) — extract last component
+                    let display = if display.starts_with('/') || display.starts_with('~') {
+                        std::path::Path::new(display)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| display.to_string())
+                    } else {
+                        display.to_string()
+                    };
                     if display.len() > 20 {
                         format!("{}…", &display[..19])
                     } else {
-                        display.to_string()
+                        display
                     }
                 })
                 .unwrap_or_else(|| tab.repo_name.clone());
@@ -6863,6 +8464,11 @@ fi
 
         // File tree entries
         for entry in &tab.file_tree {
+            let is_selected_file = !entry.is_dir
+                && tab
+                    .viewing_file_path
+                    .as_ref()
+                    .is_some_and(|selected| selected == &entry.path);
             let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
                 // Folders: blue folder icon, trailing /, light background
                 (
@@ -6899,7 +8505,15 @@ fi
                     "html" => theme.danger(),
                     _ => theme.text_secondary(),
                 };
-                ("  ", "", file_color, theme.text_primary(), None)
+                let file_name_color = if is_selected_file {
+                    match self.theme {
+                        AppTheme::Dark => color!(0xffffff),
+                        AppTheme::Light => color!(0xffffff),
+                    }
+                } else {
+                    theme.text_primary()
+                };
+                ("  ", "", file_color, file_name_color, None)
             };
 
             let entry_row = row![
@@ -6919,8 +8533,14 @@ fi
                 Event::ViewFile(entry.path.clone())
             };
 
+            let row_btn_style = if is_selected_file {
+                button::primary
+            } else {
+                button::text
+            };
+
             let file_btn = button(entry_row)
-                .style(button::text)
+                .style(row_btn_style)
                 .padding([4, 8])
                 .width(Length::Fill)
                 .on_press(event);
@@ -7281,26 +8901,30 @@ fi
             .unwrap_or(false);
         #[cfg(not(feature = "excalidraw"))]
         let is_excalidraw = false;
-        let is_markdown_webview = is_markdown && tab.webview_content.is_some();
+        let has_inline_webview =
+            tab.webview_content.is_some() && (is_markdown || is_html || is_excalidraw);
 
         let header_bg = theme.bg_overlay();
+        let ghost = self.ghost_button_style();
+        let ghost2 = self.ghost_button_style();
+        let ghost3 = self.ghost_button_style();
         let header = if is_markdown || is_html || is_excalidraw {
             // Markdown header with "View in Browser" button for Mermaid support
             row![
                 text(rel_path).size(font).color(theme.text_primary()),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("View in Browser").size(font))
-                    .style(button::secondary)
-                    .padding([4, 8])
+                    .style(ghost)
+                    .padding([4, 12])
                     .on_press(Event::OpenMarkdownInBrowser),
-                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 text("Esc: close")
                     .size(font_small)
                     .color(theme.text_secondary()),
-                iced::widget::Space::new().width(Length::Fixed(16.0)),
+                iced::widget::Space::new().width(Length::Fixed(8.0)),
                 button(text("Close").size(font))
-                    .style(button::secondary)
-                    .padding([4, 8])
+                    .style(ghost2)
+                    .padding([4, 12])
                     .on_press(Event::CloseFileView),
             ]
             .padding(8)
@@ -7310,22 +8934,22 @@ fi
                 text(rel_path).size(font).color(theme.text_primary()),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Copy All").size(font))
-                    .style(button::secondary)
-                    .padding([4, 8])
+                    .style(ghost)
+                    .padding([4, 12])
                     .on_press(Event::CopyFileContent),
-                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 button(text("Open in Browser").size(font))
-                    .style(button::secondary)
-                    .padding([4, 8])
+                    .style(ghost2)
+                    .padding([4, 12])
                     .on_press(Event::OpenFileInBrowser),
-                iced::widget::Space::new().width(Length::Fixed(8.0)),
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 text("Esc: close")
                     .size(font_small)
                     .color(theme.text_secondary()),
-                iced::widget::Space::new().width(Length::Fixed(16.0)),
+                iced::widget::Space::new().width(Length::Fixed(8.0)),
                 button(text("Close").size(font))
-                    .style(button::secondary)
-                    .padding([4, 8])
+                    .style(ghost3)
+                    .padding([4, 12])
                     .on_press(Event::CloseFileView),
             ]
             .padding(8)
@@ -7342,8 +8966,114 @@ fi
                     }),
             );
 
+        if let Some(notice) = &tab.diff_syntax_notice {
+            content = content.push(
+                container(text(notice).size(font_small).color(theme.warning()))
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(move |_| container::Style {
+                        background: Some(theme.bg_overlay().into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: theme.surface0(),
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        if let Some(notice) = &tab.file_preview_notice {
+            let notice_bg = theme.bg_overlay();
+            let notice_border = theme.surface0();
+            content = content.push(
+                container(text(notice).size(font_small).color(theme.warning()))
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(move |_| container::Style {
+                        background: Some(notice_bg.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: notice_border,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        if let Some(notice) = &tab.syntax_highlight_notice {
+            let notice_bg = theme.bg_overlay();
+            let notice_border = theme.surface0();
+            content = content.push(
+                container(text(notice).size(font_small).color(theme.text_secondary()))
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(move |_| container::Style {
+                        background: Some(notice_bg.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: notice_border,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+        let waiting_for_file_load = tab.file_load_in_progress
+            && tab.file_content.is_empty()
+            && tab.image_handle.is_none()
+            && tab.webview_content.is_none();
+        let waiting_for_initial_syntax = tab.syntax_highlight_in_progress
+            && tab.syntax_highlight_lines.is_none()
+            && !tab.file_content.is_empty()
+            && tab.webview_content.is_none()
+            && tab.image_handle.is_none();
+        let show_file_loading_message = waiting_for_file_load
+            && tab.file_load_started_at.is_some_and(|started| {
+                started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
+            });
+        let show_initial_syntax_message = waiting_for_initial_syntax
+            && tab.file_load_started_at.is_some_and(|started| {
+                started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
+            });
+
         // Check if we're viewing an image
-        if let Some(handle) = &tab.image_handle {
+        if waiting_for_file_load {
+            if show_file_loading_message {
+                content = content.push(
+                    container(
+                        text("Loading file...")
+                            .size(font)
+                            .color(theme.text_secondary()),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .padding(16),
+                );
+            } else {
+                content = content.push(iced::widget::Space::new().height(Length::Fill));
+            }
+        } else if waiting_for_initial_syntax {
+            if show_initial_syntax_message {
+                content = content.push(
+                    container(
+                        text("Highlighting syntax...")
+                            .size(font)
+                            .color(theme.text_secondary()),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .padding(16),
+                );
+            } else {
+                content = content.push(iced::widget::Space::new().height(Length::Fill));
+            }
+        } else if let Some(handle) = &tab.image_handle {
             // Display image
             let img = image(handle.clone()).content_fit(iced::ContentFit::Contain);
 
@@ -7357,44 +9087,130 @@ fi
                 .height(Length::Fill)
                 .width(Length::Fill),
             );
-        } else if is_excalidraw || is_markdown_webview || is_html {
+        } else if has_inline_webview {
             // Excalidraw, Mermaid-markdown, and HTML render inline via WebView.
             content = content.push(iced::widget::Space::new().height(Length::Fill));
-        } else if is_markdown {
-            // Render markdown with Iced-native formatting
+        } else if is_markdown && tab.file_preview_notice.is_none() && !tab.file_content.is_empty() {
+            // Fallback markdown rendering when HTML preview is unavailable.
             content = content.push(self.view_markdown_content(tab));
+        } else if is_markdown || is_html || is_excalidraw {
+            let msg = tab
+                .file_preview_notice
+                .as_deref()
+                .unwrap_or("Inline preview unavailable for this file. Click \"View in Browser\".");
+            content = content.push(
+                container(text(msg).size(font).color(theme.text_secondary()))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .padding(16),
+            );
         } else {
             // File content with line numbers
+            let render_started_at = Instant::now();
             let mut file_column = Column::new().spacing(0);
+            let mono = iced::Font::MONOSPACE;
+            let has_syntax_lines = tab.syntax_highlight_lines.is_some();
+            let total_line_count = tab.file_content.lines().count();
+            let render_line_limit = if has_syntax_lines {
+                MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX
+            } else {
+                MAX_FILE_VIEW_RENDER_LINES
+            };
+            let render_line_count = total_line_count.min(render_line_limit);
 
-            let ext = tab
-                .viewing_file_path
-                .as_ref()
-                .and_then(|p| p.extension())
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            if total_line_count > render_line_count {
+                let hidden_lines = total_line_count.saturating_sub(render_line_count);
+                let render_notice = format!(
+                    "Rendering first {} of {} lines ({} hidden) for performance.",
+                    render_line_count, total_line_count, hidden_lines
+                );
+                let notice_bg = theme.bg_overlay();
+                let notice_border = theme.surface0();
+                content = content.push(
+                    container(
+                        text(render_notice)
+                            .size(font_small)
+                            .color(theme.text_secondary()),
+                    )
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(move |_| container::Style {
+                        background: Some(notice_bg.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: notice_border,
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
 
-            for (i, line) in tab.file_content.lines().enumerate() {
+            for (i, line) in tab.file_content.lines().take(render_line_count).enumerate() {
                 let line_num = format!("{:4}", i + 1);
+                let shown_line = if line.is_empty() { " " } else { line };
 
-                // Simple syntax highlighting based on extension
-                let line_color = self.get_syntax_color(line, ext);
+                let line_body: Element<'_, Event, Theme, iced::Renderer> =
+                    if let Some(highlighted_line) = tab
+                        .syntax_highlight_lines
+                        .as_ref()
+                        .and_then(|lines| lines.get(i))
+                    {
+                        let mut content_row = Row::new().spacing(0);
+                        for segment in &highlighted_line.segments {
+                            content_row = content_row.push(
+                                text(segment.text.as_str())
+                                    .size(font)
+                                    .color(segment.color)
+                                    .font(mono),
+                            );
+                        }
+                        if highlighted_line.segments.is_empty() {
+                            content_row = content_row.push(
+                                text(shown_line)
+                                    .size(font)
+                                    .color(theme.text_primary())
+                                    .font(mono),
+                            );
+                        }
+                        container(content_row).width(Length::Fill).into()
+                    } else {
+                        text(shown_line)
+                            .size(font)
+                            .color(theme.text_primary())
+                            .font(mono)
+                            .into()
+                    };
 
                 let line_row = row![
                     text(line_num)
                         .size(font)
                         .color(theme.text_muted())
-                        .font(iced::Font::MONOSPACE),
-                    text(" ").size(font).font(iced::Font::MONOSPACE),
-                    text(line)
-                        .size(font)
-                        .color(line_color)
-                        .font(iced::Font::MONOSPACE),
+                        .font(mono),
+                    text(" ").size(font).font(mono),
+                    line_body,
                 ]
                 .spacing(0);
 
                 file_column =
                     file_column.push(container(line_row).width(Length::Fill).padding([1, 4]));
+            }
+
+            if total_line_count > render_line_count {
+                file_column = file_column.push(
+                    container(
+                        text(format!(
+                            "... {} additional lines not rendered",
+                            total_line_count.saturating_sub(render_line_count)
+                        ))
+                        .size(font_small)
+                        .color(theme.text_muted()),
+                    )
+                    .width(Length::Fill)
+                    .padding([6, 4]),
+                );
             }
 
             if tab.file_content.is_empty() {
@@ -7405,8 +9221,21 @@ fi
                 );
             }
 
+            maybe_log_file_view_build(
+                tab.viewing_file_path.as_deref(),
+                total_line_count,
+                render_line_count,
+                has_syntax_lines,
+                render_started_at.elapsed(),
+            );
+
             content = content.push(
                 scrollable(file_column.padding(8))
+                    .id(file_view_scrollable_id())
+                    .on_scroll({
+                        let tab_id = tab.id;
+                        move |viewport| Event::FileViewScrolled(tab_id, viewport)
+                    })
                     .height(Length::Fill)
                     .width(Length::Fill),
             );
@@ -7998,101 +9827,12 @@ fi
             .into()
     }
 
-    fn get_syntax_color(&self, line: &str, ext: &str) -> iced::Color {
-        let theme = &self.theme;
-        let trimmed = line.trim();
-
-        // Theme-aware syntax colors
-        let comment = theme.text_secondary();
-        let keyword = match self.theme {
-            AppTheme::Dark => color!(0xcba6f7),
-            AppTheme::Light => color!(0x8839ef),
-        };
-        let declaration = theme.accent();
-        let function = theme.success();
-        let control = theme.warning();
-        let types = match self.theme {
-            AppTheme::Dark => color!(0xfab387),
-            AppTheme::Light => color!(0xfe640b),
-        };
-        let default = theme.text_primary();
-
-        match ext {
-            "ts" | "tsx" | "js" | "jsx" => {
-                if trimmed.starts_with("//")
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with("*")
-                {
-                    comment
-                } else if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
-                    keyword
-                } else if trimmed.starts_with("const ")
-                    || trimmed.starts_with("let ")
-                    || trimmed.starts_with("var ")
-                {
-                    declaration
-                } else if trimmed.starts_with("function ")
-                    || trimmed.starts_with("async ")
-                    || trimmed.contains("=>")
-                {
-                    function
-                } else if trimmed.starts_with("return ")
-                    || trimmed.starts_with("if ")
-                    || trimmed.starts_with("else")
-                {
-                    control
-                } else {
-                    default
-                }
-            }
-            "md" => {
-                if trimmed.starts_with('#') {
-                    declaration
-                } else if trimmed.starts_with('-')
-                    || trimmed.starts_with('*')
-                    || trimmed.starts_with(|c: char| c.is_numeric())
-                {
-                    function
-                } else if trimmed.starts_with('>') {
-                    comment
-                } else if trimmed.starts_with("```") {
-                    control
-                } else {
-                    default
-                }
-            }
-            "rs" => {
-                if trimmed.starts_with("//") {
-                    comment
-                } else if trimmed.starts_with("use ")
-                    || trimmed.starts_with("mod ")
-                    || trimmed.starts_with("pub ")
-                {
-                    keyword
-                } else if trimmed.starts_with("fn ") || trimmed.starts_with("impl ") {
-                    function
-                } else if trimmed.starts_with("let ") || trimmed.starts_with("const ") {
-                    declaration
-                } else if trimmed.starts_with("struct ") || trimmed.starts_with("enum ") {
-                    types
-                } else {
-                    default
-                }
-            }
-            "json" => {
-                if trimmed.starts_with('"') && trimmed.contains(':') {
-                    declaration
-                } else {
-                    function
-                }
-            }
-            _ => default,
-        }
-    }
-
     fn view_git_list<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
+        // Only show the loading banner for the initial fetch. Subsequent polls refresh in place
+        // to avoid visible flashing in the Git list.
+        let show_loading = tab.git_status_loading && tab.last_git_status_hash.is_none();
         let mut content = Column::new().spacing(8).padding(8);
 
         // Branch display - styled rounded container with diamond icon
@@ -8120,6 +9860,14 @@ fi
                 ..Default::default()
             });
             content = content.push(branch_container);
+        }
+
+        if show_loading {
+            content = content.push(
+                text("Loading git status...")
+                    .size(font - 1.0)
+                    .color(theme.text_secondary()),
+            );
         }
 
         if !tab.staged.is_empty() {
@@ -8168,12 +9916,16 @@ fi
         }
 
         if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
-            let msg = if tab.is_git_repo {
+            let msg = if show_loading {
+                ""
+            } else if tab.is_git_repo {
                 "No changes"
             } else {
                 "Not a git repository"
             };
-            content = content.push(text(msg).size(font).color(theme.text_secondary()));
+            if !msg.is_empty() {
+                content = content.push(text(msg).size(font).color(theme.text_secondary()));
+            }
         }
 
         scrollable(content)
@@ -8270,8 +10022,8 @@ fi
                 .color(theme.text_secondary()),
             iced::widget::Space::new().width(Length::Fixed(16.0)),
             button(text("Back to Terminal").size(font))
-                .style(button::secondary)
-                .padding([4, 8])
+                .style(self.ghost_button_style())
+                .padding([4, 12])
                 .on_press(Event::ClearSelection),
         ]
         .padding(8)
@@ -8289,16 +10041,74 @@ fi
 
         // Diff content
         let mut diff_column = Column::new().spacing(0);
+        let show_diff_loading_message = tab.diff_load_in_progress
+            && tab.diff_load_started_at.is_some_and(|started| {
+                started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
+            });
 
-        if tab.diff_lines.is_empty() {
+        if tab.diff_load_in_progress {
+            if show_diff_loading_message {
+                diff_column = diff_column.push(
+                    text("Loading diff...")
+                        .size(font)
+                        .color(theme.text_secondary()),
+                );
+            }
+        } else if tab.diff_lines.is_empty() {
             diff_column = diff_column.push(
                 text("No diff available")
                     .size(font)
                     .color(theme.text_secondary()),
             );
         } else {
-            for line in &tab.diff_lines {
-                diff_column = diff_column.push(self.view_diff_line(line));
+            let total_lines = tab.diff_lines.len();
+            let rendered_lines = total_lines.min(MAX_DIFF_VIEW_RENDER_LINES);
+            if total_lines > rendered_lines {
+                diff_column = diff_column.push(
+                    container(
+                        text(format!(
+                            "Showing first {} of {} diff lines for performance.",
+                            rendered_lines, total_lines
+                        ))
+                        .size(font_small)
+                        .color(theme.warning()),
+                    )
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(move |_| container::Style {
+                        background: Some(theme.bg_overlay().into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: theme.surface0(),
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+
+            for (idx, line) in tab.diff_lines.iter().take(rendered_lines).enumerate() {
+                let syntax_segments = tab
+                    .diff_syntax_lines
+                    .as_ref()
+                    .and_then(|lines| lines.get(idx))
+                    .map(Vec::as_slice);
+                diff_column = diff_column.push(self.view_diff_line(line, syntax_segments));
+            }
+
+            if total_lines > rendered_lines {
+                diff_column = diff_column.push(
+                    container(
+                        text(format!(
+                            "... {} additional diff lines not rendered",
+                            total_lines.saturating_sub(rendered_lines)
+                        ))
+                        .size(font_small)
+                        .color(theme.text_muted()),
+                    )
+                    .width(Length::Fill)
+                    .padding([6, 8]),
+                );
             }
         }
 
@@ -8322,6 +10132,7 @@ fi
     fn view_diff_line<'a>(
         &'a self,
         line: &'a DiffLine,
+        syntax_segments: Option<&'a [SyntaxHighlightSegment]>,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
@@ -8382,6 +10193,25 @@ fi
                 }
             }
             content_row.into()
+        } else if let Some(segments) = syntax_segments {
+            if segments.is_empty() {
+                text(&line.content)
+                    .size(font)
+                    .color(line_color)
+                    .font(iced::Font::MONOSPACE)
+                    .into()
+            } else {
+                let mut content_row = Row::new().spacing(0);
+                for segment in segments {
+                    content_row = content_row.push(
+                        text(segment.text.as_str())
+                            .size(font)
+                            .color(segment.color)
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                content_row.into()
+            }
         } else {
             text(&line.content)
                 .size(font)
@@ -8970,6 +10800,24 @@ fi
             } else {
                 btn_color
             };
+            let log_server_status = if self.log_server_enabled {
+                if self.log_server_state.base_url().is_some() {
+                    ("Logs:on", theme.success())
+                } else {
+                    ("Logs:...", theme.warning())
+                }
+            } else {
+                ("Logs:off", theme.overlay0())
+            };
+            let log_toggle_btn = button(
+                text(log_server_status.0)
+                    .size(11)
+                    .color(log_server_status.1)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .style(action_btn_style)
+            .padding([2, 6])
+            .on_press(Event::ToggleLogServer);
             let search_btn = button(text("\u{2315}").size(12).color(search_icon_color))
                 .style(action_btn_style)
                 .padding([2, 6])
@@ -8980,6 +10828,7 @@ fi
                 header_row = header_row.push(btn);
             }
             header_row = header_row
+                .push(log_toggle_btn)
                 .push(search_btn)
                 .push(clear_btn)
                 .push(restart_btn)
@@ -9810,6 +11659,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
         assert!(snapshot.entries.is_empty());
+    }
+
+    #[test]
+    fn read_text_preview_limits_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+        let preview = read_text_preview(&file, 1024, 3).unwrap();
+        assert_eq!(preview, "a\nb\nc");
+    }
+
+    #[test]
+    fn format_bytes_human_readable() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn syntect_detects_typescript_extensions() {
+        let ts = syntect_syntax_for_path(Path::new("example.ts"));
+        let tsx = syntect_syntax_for_path(Path::new("example.tsx"));
+
+        assert_ne!(ts.name, "Plain Text");
+        assert_ne!(tsx.name, "Plain Text");
     }
 
     // === add_word_diffs_to_lines ===
