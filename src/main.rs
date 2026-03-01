@@ -215,6 +215,14 @@ struct Config {
     stt_model_path: Option<String>,
     #[serde(default = "default_agent_presets")]
     agent_presets: Vec<AgentPreset>,
+    #[serde(default)]
+    quick_commands: Vec<QuickCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QuickCommand {
+    name: String,
+    command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +244,13 @@ fn default_agent_color() -> WorkspaceColor {
 
 fn default_agent_presets() -> Vec<AgentPreset> {
     vec![
+        AgentPreset {
+            name: "Pi".to_string(),
+            command: "pi".to_string(),
+            resume_command: Some("pi --resume".to_string()),
+            icon: "\u{03c0}".to_string(), // π
+            color: WorkspaceColor::Pink,
+        },
         AgentPreset {
             name: "Claude Code".to_string(),
             command: "claude".to_string(),
@@ -304,6 +319,7 @@ impl Default for Config {
             #[cfg(feature = "stt")]
             stt_model_path: None,
             agent_presets: default_agent_presets(),
+            quick_commands: Vec::new(),
         }
     }
 }
@@ -3204,6 +3220,10 @@ pub enum Event {
     LaunchAgentPreset(usize),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
+    // Quick commands (run in bottom terminal)
+    RunQuickCommand(usize),
+    ShowQuickCommands,
+    HideQuickCommands,
     // Plain terminal tab (no startup command)
     NewPlainTab,
     // Tab picker popup
@@ -3291,6 +3311,10 @@ struct App {
     tab_picker_visible: bool,
     // Configured agent presets
     agent_presets: Vec<AgentPreset>,
+    // Quick commands (app-level, run in bottom terminal)
+    quick_commands: Vec<QuickCommand>,
+    // Quick commands picker visibility
+    quick_commands_visible: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
     workspaces_dirty: bool,
@@ -3597,6 +3621,7 @@ impl App {
             #[cfg(feature = "stt")]
             stt_model_path: None,
             agent_presets: self.agent_presets.clone(),
+            quick_commands: self.quick_commands.clone(),
         };
         config.save();
     }
@@ -4007,6 +4032,8 @@ impl App {
             show_help: false,
             tab_picker_visible: false,
             agent_presets: config.agent_presets.clone(),
+            quick_commands: config.quick_commands.clone(),
+            quick_commands_visible: false,
             bottom_panel_focused: false,
             workspaces_dirty: false,
             next_workspace_save_at: None,
@@ -4873,6 +4900,58 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::ShowQuickCommands => {
+                if !self.quick_commands.is_empty() {
+                    self.quick_commands_visible = true;
+                }
+            }
+            Event::HideQuickCommands => {
+                self.quick_commands_visible = false;
+            }
+            Event::RunQuickCommand(idx) => {
+                self.quick_commands_visible = false;
+                if let Some(qc) = self.quick_commands.get(idx).cloned() {
+                    let cmd_bytes = format!("{}\n", qc.command).into_bytes();
+                    // Find active bottom terminal, or create one
+                    let has_bottom_terminal = self.active_workspace().map(|ws| {
+                        matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(_))
+                            && !ws.bottom_terminals.is_empty()
+                    }).unwrap_or(false);
+
+                    if !has_bottom_terminal {
+                        // Create a bottom terminal first
+                        let dir = self
+                            .active_workspace()
+                            .map(|ws| {
+                                ws.active_tab()
+                                    .map(|t| t.current_dir.clone())
+                                    .unwrap_or_else(|| ws.dir.clone())
+                            })
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        let bt = self.create_bottom_terminal(dir);
+                        if let Some(ws) = self.active_workspace_mut() {
+                            ws.bottom_terminals.push(bt);
+                            let idx = ws.bottom_terminals.len() - 1;
+                            ws.active_bottom_tab = BottomPanelTab::Terminal(idx);
+                        }
+                        self.console_expanded = true;
+                    }
+
+                    // Write the command to the active bottom terminal
+                    if let Some(ws) = self.active_workspace_mut() {
+                        if let BottomPanelTab::Terminal(bt_idx) = ws.active_bottom_tab {
+                            if let Some(bt) = ws.bottom_terminals.get_mut(bt_idx) {
+                                if let Some(term) = &mut bt.terminal {
+                                    term.handle(iced_term::Command::ProxyToBackend(
+                                        iced_term::backend::Command::Write(cmd_bytes),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    self.mark_workspaces_dirty();
+                }
+            }
             Event::NewPlainTab => {
                 // Create a plain terminal tab (no startup command)
                 self.tab_picker_visible = false;
@@ -5184,6 +5263,13 @@ fi
                 if self.tab_picker_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.tab_picker_visible = false;
+                    return Task::none();
+                }
+
+                // Quick commands picker: Escape closes
+                if self.quick_commands_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.quick_commands_visible = false;
                     return Task::none();
                 }
 
@@ -10421,7 +10507,7 @@ fi
         };
 
         let bg = theme.bg_crust();
-        container(
+        let main_panel = container(
             column![tab_bar, content]
                 .spacing(0)
                 .width(Length::Fill)
@@ -10432,8 +10518,114 @@ fi
         .style(move |_| container::Style {
             background: Some(bg.into()),
             ..Default::default()
-        })
-        .into()
+        });
+
+        if self.quick_commands_visible {
+            Stack::new()
+                .push(main_panel)
+                .push(self.view_quick_commands_picker())
+                .width(Length::Fill)
+                .height(Length::Fixed(self.console_height))
+                .into()
+        } else {
+            main_panel.into()
+        }
+    }
+
+    fn view_quick_commands_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_surface();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        let mono = iced::Font::with_name("Menlo");
+
+        let mut items = Column::new().spacing(0).width(Length::Fixed(260.0));
+        for (idx, qc) in self.quick_commands.iter().enumerate() {
+            let hover = hover_bg;
+            let name = qc.name.clone();
+            let command = qc.command.clone();
+            items = items.push(
+                button(
+                    row![
+                        text("\u{25b8}")
+                            .size(12)
+                            .color(theme.peach())
+                            .font(mono)
+                            .width(Length::Fixed(20.0)),
+                        column![
+                            text(name).size(13).color(text_primary),
+                            text(command).size(11).color(text_secondary).font(mono),
+                        ]
+                        .spacing(1)
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .padding([6, 10]),
+                )
+                .style(move |_theme, status| {
+                    let bg_color = if matches!(status, button::Status::Hovered) {
+                        Some(hover.into())
+                    } else {
+                        None
+                    };
+                    button::Style {
+                        background: bg_color,
+                        text_color: text_primary,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    }
+                })
+                .padding(0)
+                .width(Length::Fill)
+                .on_press(Event::RunQuickCommand(idx)),
+            );
+        }
+
+        let picker_menu = container(items)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                    offset: iced::Vector::new(0.0, -2.0),
+                    blur_radius: 8.0,
+                },
+                ..Default::default()
+            })
+            .padding(4);
+
+        // Click-away backdrop
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::HideQuickCommands);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(picker_menu)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Left)
+                    .align_y(iced::alignment::Vertical::Top)
+                    .padding(iced::Padding {
+                        top: 4.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 8.0,
+                    }),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_bottom_tab_bar<'a>(
@@ -10671,7 +10863,35 @@ fi
         for tb in tab_buttons {
             header_row = header_row.push(tb);
         }
-        header_row = header_row.push(plus_btn).push(spacer);
+        header_row = header_row.push(plus_btn);
+
+        // Quick commands button (⚡) — only show if commands are configured
+        if !self.quick_commands.is_empty() {
+            let qc_color = theme.peach();
+            let qc_hover_bg = theme.surface0();
+            let qc_btn = button(text("\u{26a1}").size(12).color(qc_color))
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        qc_hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        text_color: qc_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 6])
+                .on_press(Event::ShowQuickCommands);
+            header_row = header_row.push(qc_btn);
+        }
+
+        header_row = header_row.push(spacer);
 
         // Console-specific controls on the right
         if console_is_active {
