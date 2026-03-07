@@ -6,9 +6,9 @@ use iced::widget::{
     Stack,
 };
 use iced::{color, Length, Size, Subscription, Task, Theme};
-use iced_term::{ColorPalette, SearchMatch, TerminalView};
+use iced_term::{SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use serde::{Deserialize, Serialize};
+
 use similar::{ChangeTag, TextDiff};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -30,6 +30,167 @@ mod log_server;
 mod markdown;
 mod services;
 mod webview;
+
+// New modules
+mod agent;
+mod config;
+mod events;
+mod theme;
+
+
+// Start with just config for now to avoid conflicts
+use config::{Config, WorkspaceColor, AgentPreset, QuickCommand, WorkspacesFile, WorkspaceConfig, WorkspaceTabConfig, BottomTerminalConfig};
+use events::SidebarMode;
+use theme::AppTheme;
+
+// Freeze debugging
+static FREEZE_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Main thread heartbeat for freeze detection
+static MAIN_THREAD_HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAIN_THREAD_LAST_EVENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+// Store main thread ID so watchdog can signal it for backtrace
+static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn start_freeze_watchdog() {
+    if !freeze_debug_enabled() {
+        return;
+    }
+    
+    // Store main thread's pthread ID for signaling
+    #[cfg(unix)]
+    {
+        let tid = unsafe { libc::pthread_self() } as u64;
+        MAIN_THREAD_ID.store(tid, std::sync::atomic::Ordering::Relaxed);
+        
+        // Install SIGUSR1 handler that prints backtrace
+        unsafe {
+            libc::signal(libc::SIGUSR1, freeze_backtrace_handler as libc::sighandler_t);
+        }
+    }
+    
+    std::thread::Builder::new()
+        .name("freeze-watchdog".to_string())
+        .spawn(|| {
+            let mut last_beat = 0u64;
+            let mut stall_start: Option<std::time::Instant> = None;
+            let mut backtrace_sent = false;
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let current = MAIN_THREAD_HEARTBEAT.load(std::sync::atomic::Ordering::Relaxed);
+                if current == last_beat {
+                    // Main thread hasn't ticked
+                    if stall_start.is_none() {
+                        stall_start = Some(std::time::Instant::now());
+                        backtrace_sent = false;
+                    }
+                    let elapsed = stall_start.unwrap().elapsed();
+                    if elapsed.as_secs() >= 2 {
+                        let event_name = MAIN_THREAD_LAST_EVENT.lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        eprintln!(
+                            "[FREEZE-WATCHDOG] Main thread stalled for {:.1}s! Last event: {}",
+                            elapsed.as_secs_f64(),
+                            event_name
+                        );
+                        
+                        // Send SIGUSR1 to main thread once at 5s to capture backtrace
+                        #[cfg(unix)]
+                        if elapsed.as_secs() >= 5 && !backtrace_sent {
+                            backtrace_sent = true;
+                            let tid = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
+                            if tid != 0 {
+                                eprintln!("[FREEZE-WATCHDOG] Sending SIGUSR1 to main thread for backtrace...");
+                                unsafe {
+                                    libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(start) = stall_start.take() {
+                        let dur = start.elapsed();
+                        if dur.as_secs() >= 2 {
+                            eprintln!(
+                                "[FREEZE-WATCHDOG] Main thread recovered after {:.1}s stall",
+                                dur.as_secs_f64()
+                            );
+                        }
+                    }
+                    last_beat = current;
+                }
+            }
+        })
+        .ok();
+}
+
+/// Signal handler: prints backtrace when SIGUSR1 is received on the main thread.
+/// This runs IN the frozen main thread's context, so the backtrace shows exactly
+/// where it's stuck.
+#[cfg(unix)]
+extern "C" fn freeze_backtrace_handler(_sig: libc::c_int) {
+    // Signal handlers must be async-signal-safe. write() to stderr is safe.
+    // std::backtrace::Backtrace is NOT signal-safe, but for debugging a freeze
+    // it's acceptable — the thread is already stuck.
+    let bt = std::backtrace::Backtrace::force_capture();
+    let msg = format!(
+        "\n[FREEZE-WATCHDOG] === MAIN THREAD BACKTRACE ===\n{}\n[FREEZE-WATCHDOG] === END BACKTRACE ===\n",
+        bt
+    );
+    // Use raw write to avoid any locking in eprintln
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+    }
+}
+
+/// Record that the main thread processed an event
+fn heartbeat(event_name: &str) {
+    MAIN_THREAD_HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if freeze_debug_enabled() {
+        if let Ok(mut guard) = MAIN_THREAD_LAST_EVENT.try_lock() {
+            *guard = Some(event_name.to_string());
+        }
+    }
+}
+
+/// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn freeze_debug_enabled() -> bool {
+    FREEZE_DEBUG.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("GITTERM_DEBUG_FREEZES").is_ok()
+}
+
+macro_rules! freeze_debug {
+    ($($arg:tt)*) => {{
+        if freeze_debug_enabled() {
+            eprintln!("[FREEZE-DEBUG] {}", format_args!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! freeze_time {
+    ($label:expr, $block:block) => {{
+        let _start = std::time::Instant::now();
+        let result = $block;
+        let _elapsed = _start.elapsed();
+        if _elapsed > Duration::from_millis(50) {
+            freeze_debug!("{} took {}ms", $label, _elapsed.as_millis());
+        }
+        result
+    }};
+}
 
 // Menu item IDs stored globally for event matching
 static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
@@ -184,476 +345,10 @@ fn setup_menu_bar() {
     Box::leak(Box::new(menu));
 }
 
-// Persistent configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    #[serde(default = "default_terminal_font")]
-    terminal_font_size: f32,
-    #[serde(default = "default_ui_font")]
-    ui_font_size: f32,
-    #[serde(default = "default_sidebar_width")]
-    sidebar_width: f32,
-    #[serde(default = "default_scrollback_lines")]
-    scrollback_lines: usize,
-    // Legacy field for migration
-    #[serde(default)]
-    font_size: Option<f32>,
-    theme: String,
-    #[serde(default)]
-    show_hidden: bool,
-    #[serde(default = "default_console_height")]
-    console_height: f32,
-    #[serde(default = "default_console_expanded")]
-    console_expanded: bool,
-    #[serde(default = "default_log_server_enabled")]
-    log_server_enabled: bool,
-    #[cfg(feature = "stt")]
-    #[serde(default = "default_stt_enabled")]
-    stt_enabled: bool,
-    #[cfg(feature = "stt")]
-    #[serde(default)]
-    stt_model_path: Option<String>,
-    #[serde(default = "default_agent_presets")]
-    agent_presets: Vec<AgentPreset>,
-    #[serde(default)]
-    quick_commands: Vec<QuickCommand>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QuickCommand {
-    name: String,
-    command: String,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentPreset {
-    name: String,
-    command: String,
-    /// Command to resume the last session (e.g. "claude --resume", "codex resume")
-    #[serde(default)]
-    resume_command: Option<String>,
-    #[serde(default)]
-    icon: String,
-    #[serde(default = "default_agent_color")]
-    color: WorkspaceColor,
-}
 
-fn default_agent_color() -> WorkspaceColor {
-    WorkspaceColor::Lavender
-}
 
-fn default_agent_presets() -> Vec<AgentPreset> {
-    vec![
-        AgentPreset {
-            name: "Pi".to_string(),
-            command: "pi".to_string(),
-            resume_command: Some("pi --resume".to_string()),
-            icon: "\u{03c0}".to_string(), // π
-            color: WorkspaceColor::Pink,
-        },
-        AgentPreset {
-            name: "Claude Code".to_string(),
-            command: "claude".to_string(),
-            resume_command: Some("claude --resume".to_string()),
-            icon: "\u{276f}".to_string(),
-            color: WorkspaceColor::Peach,
-        },
-        AgentPreset {
-            name: "Codex".to_string(),
-            command: "codex".to_string(),
-            resume_command: Some("codex resume".to_string()),
-            icon: "\u{2261}".to_string(),
-            color: WorkspaceColor::Green,
-        },
-        AgentPreset {
-            name: "Gemini".to_string(),
-            command: "gemini".to_string(),
-            resume_command: Some("gemini --resume".to_string()),
-            icon: "G".to_string(),
-            color: WorkspaceColor::Blue,
-        },
-    ]
-}
-
-fn default_terminal_font() -> f32 {
-    14.0
-}
-fn default_ui_font() -> f32 {
-    13.0
-}
-fn default_sidebar_width() -> f32 {
-    280.0
-}
-fn default_scrollback_lines() -> usize {
-    100_000
-}
-fn default_console_height() -> f32 {
-    DEFAULT_CONSOLE_HEIGHT
-}
-fn default_console_expanded() -> bool {
-    true
-}
-fn default_log_server_enabled() -> bool {
-    false
-}
-#[cfg(feature = "stt")]
-fn default_stt_enabled() -> bool {
-    true
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            terminal_font_size: 14.0,
-            ui_font_size: 13.0,
-            sidebar_width: 280.0,
-            scrollback_lines: 100_000,
-            font_size: None,
-            theme: "dark".to_string(),
-            show_hidden: false,
-            console_height: DEFAULT_CONSOLE_HEIGHT,
-            console_expanded: true,
-            log_server_enabled: false,
-            #[cfg(feature = "stt")]
-            stt_enabled: true,
-            #[cfg(feature = "stt")]
-            stt_model_path: None,
-            agent_presets: default_agent_presets(),
-            quick_commands: Vec::new(),
-        }
-    }
-}
-
-impl Config {
-    fn config_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join(".config")
-            .join("gitterm")
-            .join("config.json")
-    }
-
-    fn load() -> Self {
-        let path = Self::config_path();
-        if path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&contents) {
-                    return config;
-                }
-            }
-        }
-        Self::default()
-    }
-
-    fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-}
-
-// Workspace persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspacesFile {
-    workspaces: Vec<WorkspaceConfig>,
-    active_workspace: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceConfig {
-    name: String,
-    abbrev: String,
-    dir: String,
-    color: WorkspaceColor,
-    tabs: Vec<WorkspaceTabConfig>,
-    #[serde(default)]
-    run_command: Option<String>,
-    #[serde(default)]
-    bottom_terminals: Vec<BottomTerminalConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceTabConfig {
-    dir: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    repo_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    startup_command: Option<String>,
-}
-
-impl WorkspacesFile {
-    fn file_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join(".config")
-            .join("gitterm")
-            .join("workspaces.json")
-    }
-
-    fn load() -> Option<Self> {
-        let path = Self::file_path();
-        if path.exists() {
-            let contents = std::fs::read_to_string(&path).ok()?;
-            serde_json::from_str(&contents).ok()
-        } else {
-            None
-        }
-    }
-
-    fn save(&self) {
-        let path = Self::file_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-}
-
-// App theme (affects entire UI)
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-enum AppTheme {
-    #[default]
-    Dark,
-    Light,
-}
-
-impl AppTheme {
-    fn toggle(&self) -> Self {
-        match self {
-            AppTheme::Dark => AppTheme::Light,
-            AppTheme::Light => AppTheme::Dark,
-        }
-    }
-
-    // Terminal color palette
-    fn terminal_palette(&self) -> ColorPalette {
-        match self {
-            AppTheme::Dark => ColorPalette {
-                // Catppuccin Mocha
-                background: String::from("#1e1e2e"),
-                foreground: String::from("#cdd6f4"),
-                black: String::from("#45475a"),
-                red: String::from("#f38ba8"),
-                green: String::from("#a6e3a1"),
-                yellow: String::from("#f9e2af"),
-                blue: String::from("#89b4fa"),
-                magenta: String::from("#f5c2e7"),
-                cyan: String::from("#94e2d5"),
-                white: String::from("#bac2de"),
-                bright_black: String::from("#585b70"),
-                bright_red: String::from("#f38ba8"),
-                bright_green: String::from("#a6e3a1"),
-                bright_yellow: String::from("#f9e2af"),
-                bright_blue: String::from("#89b4fa"),
-                bright_magenta: String::from("#f5c2e7"),
-                bright_cyan: String::from("#94e2d5"),
-                bright_white: String::from("#a6adc8"),
-                bright_foreground: Some(String::from("#cdd6f4")),
-                dim_foreground: String::from("#7f849c"),
-                dim_black: String::from("#313244"),
-                dim_red: String::from("#a65d6d"),
-                dim_green: String::from("#6e9a6d"),
-                dim_yellow: String::from("#a69a74"),
-                dim_blue: String::from("#5d78a6"),
-                dim_magenta: String::from("#a6849c"),
-                dim_cyan: String::from("#649a92"),
-                dim_white: String::from("#7f849c"),
-            },
-            AppTheme::Light => ColorPalette {
-                // Catppuccin Latte
-                background: String::from("#eff1f5"),
-                foreground: String::from("#4c4f69"),
-                black: String::from("#5c5f77"),
-                red: String::from("#d20f39"),
-                green: String::from("#40a02b"),
-                yellow: String::from("#df8e1d"),
-                blue: String::from("#1e66f5"),
-                magenta: String::from("#ea76cb"),
-                cyan: String::from("#179299"),
-                white: String::from("#acb0be"),
-                bright_black: String::from("#6c6f85"),
-                bright_red: String::from("#d20f39"),
-                bright_green: String::from("#40a02b"),
-                bright_yellow: String::from("#df8e1d"),
-                bright_blue: String::from("#1e66f5"),
-                bright_magenta: String::from("#ea76cb"),
-                bright_cyan: String::from("#179299"),
-                bright_white: String::from("#bcc0cc"),
-                bright_foreground: Some(String::from("#4c4f69")),
-                dim_foreground: String::from("#6c6f85"),
-                dim_black: String::from("#4c4f69"),
-                dim_red: String::from("#a10c2d"),
-                dim_green: String::from("#338022"),
-                dim_yellow: String::from("#b27117"),
-                dim_blue: String::from("#1852c4"),
-                dim_magenta: String::from("#bb5ea2"),
-                dim_cyan: String::from("#12747a"),
-                dim_white: String::from("#8c8fa1"),
-            },
-        }
-    }
-
-    // UI Colors
-    fn bg_base(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x1e1e2e),
-            AppTheme::Light => color!(0xeff1f5),
-        }
-    }
-
-    fn bg_surface(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x181825),
-            AppTheme::Light => color!(0xe6e9ef),
-        }
-    }
-
-    fn bg_overlay(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x313244),
-            AppTheme::Light => color!(0xdce0e8),
-        }
-    }
-
-    fn text_primary(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xcdd6f4),
-            AppTheme::Light => color!(0x4c4f69),
-        }
-    }
-
-    fn text_secondary(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x6c7086),
-            AppTheme::Light => color!(0x8c8fa1),
-        }
-    }
-
-    fn text_muted(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x45475a),
-            AppTheme::Light => color!(0xbcc0cc),
-        }
-    }
-
-    fn accent(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x89b4fa),
-            AppTheme::Light => color!(0x1e66f5),
-        }
-    }
-
-    fn border(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x45475a),
-            AppTheme::Light => color!(0xccd0da),
-        }
-    }
-
-    fn success(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xa6e3a1),
-            AppTheme::Light => color!(0x40a02b),
-        }
-    }
-
-    fn warning(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xf9e2af),
-            AppTheme::Light => color!(0xdf8e1d),
-        }
-    }
-
-    fn danger(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xf38ba8),
-            AppTheme::Light => color!(0xd20f39),
-        }
-    }
-
-    fn diff_add_bg(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x1a3a1a),
-            AppTheme::Light => color!(0xd4f4d4),
-        }
-    }
-
-    fn diff_del_bg(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x3a1a1a),
-            AppTheme::Light => color!(0xf4d4d4),
-        }
-    }
-
-    fn diff_add_highlight(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x3a6b3a),
-            AppTheme::Light => color!(0x90d090),
-        }
-    }
-
-    fn diff_del_highlight(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x8b3a3a),
-            AppTheme::Light => color!(0xd09090),
-        }
-    }
-
-    fn bg_crust(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x11111b),
-            AppTheme::Light => color!(0xdce0e8),
-        }
-    }
-
-    fn mauve(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xcba6f7),
-            AppTheme::Light => color!(0x8839ef),
-        }
-    }
-
-    fn peach(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0xfab387),
-            AppTheme::Light => color!(0xfe640b),
-        }
-    }
-
-    fn surface0(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x313244),
-            AppTheme::Light => color!(0xccd0da),
-        }
-    }
-
-    fn surface2(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x585b70),
-            AppTheme::Light => color!(0xacb0be),
-        }
-    }
-
-    fn overlay0(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x6c7086),
-            AppTheme::Light => color!(0x9ca0b0),
-        }
-    }
-
-    fn overlay1(&self) -> iced::Color {
-        match self {
-            AppTheme::Dark => color!(0x7f849c),
-            AppTheme::Light => color!(0x8c8fa1),
-        }
-    }
-}
 
 // === Speech-to-Text helpers ===
 
@@ -799,6 +494,12 @@ fn stt_transcribe(
 }
 
 fn main() -> iced::Result {
+    // Print instance information for multi-instance support
+    config::print_instance_info();
+    
+    // Start freeze detection watchdog
+    start_freeze_watchdog();
+    
     // Load app icon from embedded PNG
     let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
 
@@ -816,13 +517,7 @@ fn main() -> iced::Result {
         .run()
 }
 
-// Sidebar mode toggle
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SidebarMode {
-    Git,
-    Files,
-    Claude,
-}
+
 
 // Git file entry
 #[derive(Debug, Clone)]
@@ -922,7 +617,7 @@ struct SearchState {
 // Console panel constants
 const CONSOLE_HEADER_HEIGHT: f32 = 32.0;
 const CONSOLE_DIVIDER_HEIGHT: f32 = 3.0;
-const DEFAULT_CONSOLE_HEIGHT: f32 = 200.0;
+
 const MAX_CONSOLE_LINES: usize = 1000;
 const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
 const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
@@ -1864,6 +1559,7 @@ impl ConsoleState {
                 .arg(&cmd_str)
                 .current_dir(&dir)
                 .env("TERM", "dumb")
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
@@ -2084,6 +1780,12 @@ struct TabState {
     startup_command: Option<String>,
     // Claude config tree view
     claude_config: ClaudeConfig,
+    // Agent activity tracking
+    agent_activity: Option<agent::AgentActivity>,
+    agent_activity_loading: bool,
+    // Agent conversation viewer
+    selected_capture_idx: Option<usize>,
+    agent_conversation: Option<agent::Conversation>,
     is_git_repo: bool,
 }
 
@@ -2141,6 +1843,10 @@ impl TabState {
             needs_attention: false,
             startup_command: None,
             claude_config: ClaudeConfig::default(),
+            agent_activity: None,
+            agent_activity_loading: false,
+            selected_capture_idx: None,
+            agent_conversation: None,
             is_git_repo,
         }
     }
@@ -2245,10 +1951,6 @@ impl TabState {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
 
-                // Skip hidden files unless show_hidden is true
-                if !show_hidden && name.starts_with('.') {
-                    continue;
-                }
                 // Always skip node_modules and target
                 if name == "node_modules" || name == "target" {
                     continue;
@@ -2286,7 +1988,23 @@ impl TabState {
         self.syntax_highlight_requested_lines = 0;
         self.viewing_file_path = Some(path.clone());
 
-        let file_size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+        let file_size = freeze_time!("file metadata check", {
+            std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
+        });
+        
+        // Warn about potentially problematic files
+        if file_size > 1_000_000 { // 1MB
+            freeze_debug!("Loading large file ({} bytes): {}", file_size, path.display());
+        }
+        
+        // Refuse to load extremely large files synchronously
+        if file_size > 50_000_000 { // 50MB
+            self.file_preview_notice = Some(format!(
+                "File too large ({}) for inline preview. Click \"View in Browser\" to open externally.",
+                format_bytes(file_size)
+            ));
+            return;
+        }
 
         #[cfg(feature = "excalidraw")]
         if excalidraw::is_excalidraw_file(path) {
@@ -2297,7 +2015,10 @@ impl TabState {
                 ));
                 return;
             }
-            if let Ok(content) = std::fs::read_to_string(path) {
+            let content_result = freeze_time!("excalidraw file read", {
+                std::fs::read_to_string(path)
+            });
+            if let Ok(content) = content_result {
                 if excalidraw::validate_excalidraw(&content) {
                     let html = excalidraw::render_excalidraw_html(&content, is_dark_theme);
                     self.webview_content = Some(html);
@@ -2315,7 +2036,10 @@ impl TabState {
                 return;
             }
             // Load as markdown - render to HTML and store for potential browser viewing
-            if let Ok(content) = std::fs::read_to_string(path) {
+            let content_result = freeze_time!("markdown file read", {
+                std::fs::read_to_string(path)
+            });
+            if let Ok(content) = content_result {
                 let html = markdown::render_markdown_to_html(&content, is_dark_theme);
                 self.webview_content = Some(html);
             }
@@ -2327,7 +2051,10 @@ impl TabState {
                 ));
                 return;
             }
-            if let Ok(content) = std::fs::read_to_string(path) {
+            let content_result = freeze_time!("HTML file read", {
+                std::fs::read_to_string(path)
+            });
+            if let Ok(content) = content_result {
                 self.webview_content = Some(content);
             }
         } else if Self::is_image_file(path) {
@@ -2347,9 +2074,36 @@ impl TabState {
                 LARGE_TEXT_PREVIEW_LINES,
                 LARGE_TEXT_PREVIEW_BYTES / 1024
             ));
-        } else if let Ok(content) = std::fs::read_to_string(path) {
-            // Load as text
-            self.file_content = content;
+        } else {
+            // For large files, show a preview only  
+            if file_size > 5_000_000 { // 5MB
+                let preview_result = freeze_time!("large text file preview", {
+                    read_text_preview(path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
+                });
+                match preview_result {
+                    Ok(preview) => {
+                        self.file_content = preview;
+                        self.file_preview_notice = Some(format!(
+                            "Large file ({}): showing preview only. Click \"View in Browser\" for full content.",
+                            format_bytes(file_size)
+                        ));
+                    }
+                    Err(_) => {
+                        self.file_preview_notice = Some(format!(
+                            "Could not load file preview ({})",
+                            format_bytes(file_size)
+                        ));
+                    }
+                }
+            } else {
+                let content_result = freeze_time!("text file read", {
+                    std::fs::read_to_string(path)
+                });
+                if let Ok(content) = content_result {
+                    // Load as text
+                    self.file_content = content;
+                }
+            }
         }
 
         if self.webview_content.is_none()
@@ -2434,6 +2188,23 @@ impl TabState {
             }
         }
         self.last_poll = Instant::now();
+    }
+
+    fn fetch_agent_activity(&mut self) -> Task<Event> {
+        self.agent_activity_loading = true;
+        let tab_id = self.id;
+        let repo_path = self.repo_path.clone();
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || {
+                    agent::AgentActivity::load_from_repo(&repo_path)
+                }).await {
+                    Ok(result) => (tab_id, result),
+                    Err(e) => (tab_id, Err(format!("spawn_blocking failed: {}", e))),
+                }
+            },
+            |(tab_id, result)| Event::AgentActivityLoaded(tab_id, result),
+        )
     }
 
     fn fetch_claude_config(&mut self) {
@@ -2788,70 +2559,7 @@ impl TabState {
     }
 }
 
-// Workspace color palette
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum WorkspaceColor {
-    Lavender,
-    Blue,
-    Green,
-    Peach,
-    Pink,
-    Yellow,
-    Red,
-    Teal,
-}
 
-impl WorkspaceColor {
-    fn color(&self, theme: &AppTheme) -> iced::Color {
-        match theme {
-            AppTheme::Dark => match self {
-                Self::Lavender => color!(0xb4befe),
-                Self::Blue => color!(0x89b4fa),
-                Self::Green => color!(0xa6e3a1),
-                Self::Peach => color!(0xfab387),
-                Self::Pink => color!(0xf5c2e7),
-                Self::Yellow => color!(0xf9e2af),
-                Self::Red => color!(0xf38ba8),
-                Self::Teal => color!(0x94e2d5),
-            },
-            AppTheme::Light => match self {
-                Self::Lavender => color!(0x7287fd),
-                Self::Blue => color!(0x1e66f5),
-                Self::Green => color!(0x40a02b),
-                Self::Peach => color!(0xfe640b),
-                Self::Pink => color!(0xea76cb),
-                Self::Yellow => color!(0xdf8e1d),
-                Self::Red => color!(0xd20f39),
-                Self::Teal => color!(0x179299),
-            },
-        }
-    }
-
-    const ALL: [Self; 8] = [
-        Self::Lavender,
-        Self::Blue,
-        Self::Green,
-        Self::Peach,
-        Self::Pink,
-        Self::Yellow,
-        Self::Red,
-        Self::Teal,
-    ];
-
-    fn from_index(idx: usize) -> Self {
-        Self::ALL[idx % Self::ALL.len()]
-    }
-
-    /// Pick the first color not already used by existing workspaces
-    fn next_available(used: &[Self]) -> Self {
-        Self::ALL
-            .iter()
-            .find(|c| !used.contains(c))
-            .copied()
-            .unwrap_or_else(|| Self::from_index(used.len()))
-    }
-}
 
 // Bottom panel tab types
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2867,10 +2575,7 @@ struct BottomTerminal {
     cwd: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BottomTerminalConfig {
-    dir: String,
-}
+
 
 // Workspace groups tabs by project
 struct Workspace {
@@ -3217,6 +2922,9 @@ pub enum Event {
     AttentionPulseTick,
     AttentionJumpNext,
     // Launch agent preset by index
+    AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
+    AgentConversationLoaded(usize, agent::Conversation),
+    SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
@@ -3731,20 +3439,37 @@ impl App {
         self.log_server_dirty = false;
         self.next_log_server_sync_at =
             Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
-        let started = Instant::now();
 
+        // PERFORMANCE: Terminal content extraction (get_all_text) is expensive — it
+        // locks each terminal mutex and iterates the entire scrollback history.
+        // With many tabs this caused 80+ second freezes on the main thread.
+        // 
+        // Mitigation: budget a max time for the collection phase and bail early
+        // if it takes too long.  Each individual get_all_text() call is still
+        // synchronous (Terminal is not Send), but we cap total collection time.
+        
+        let started = Instant::now();
+        const LOG_SYNC_BUDGET_MS: u128 = 200; // Max 200ms on main thread
+        
         let state = self.log_server_state.clone();
         let mut terminal_snapshots = std::collections::HashMap::new();
         let mut file_snapshots = std::collections::HashMap::new();
         let mut terminal_bytes = 0usize;
         let mut file_bytes = 0usize;
         let mut snapshot_hasher = DefaultHasher::new();
+        let mut budget_exceeded = false;
 
         // Collect terminal content and file content from all tabs across all workspaces
         for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
             tab.id.hash(&mut snapshot_hasher);
 
             if let Some(term) = &tab.terminal {
+                // Check time budget before expensive get_all_text()
+                if started.elapsed().as_millis() > LOG_SYNC_BUDGET_MS {
+                    budget_exceeded = true;
+                    false.hash(&mut snapshot_hasher);
+                    continue;
+                }
                 true.hash(&mut snapshot_hasher);
                 let content = term.get_all_text();
                 terminal_bytes += content.len();
@@ -3778,6 +3503,10 @@ impl App {
             } else {
                 false.hash(&mut snapshot_hasher);
             }
+        }
+
+        if budget_exceeded {
+            freeze_debug!("log_sync budget exceeded ({}ms) - skipped some terminals", started.elapsed().as_millis());
         }
 
         let snapshot_hash = snapshot_hasher.finish();
@@ -3822,13 +3551,19 @@ impl App {
                 {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
-                        eprintln!(
-                            "[git-status] spawn_blocking failed for tab {} ({}): {}",
+                        freeze_debug!("CRITICAL: spawn_blocking failed! Skipping git status for tab {} ({}): {}", 
+                                     tab_id, fallback_repo_path.display(), err);
+                        // Return empty snapshot instead of blocking main thread
+                        GitStatusSnapshot {
                             tab_id,
-                            fallback_repo_path.display(),
-                            err
-                        );
-                        collect_git_status(tab_id, fallback_repo_path)
+                            repo_path: fallback_repo_path,
+                            repo_name: "unknown".to_string(),
+                            branch_name: "main".to_string(),
+                            is_git_repo: true,
+                            staged: Vec::new(),
+                            unstaged: Vec::new(),
+                            untracked: Vec::new(),
+                        }
                     }
                 }
             },
@@ -4529,6 +4264,17 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        // Heartbeat for freeze watchdog — skip high-frequency terminal events
+        match &event {
+            Event::Terminal(_, _) | Event::BottomTerminalEvent(_, _) => {},
+            Event::CheckMenu => { heartbeat("CheckMenu"); },
+            Event::SlideAnimationTick => { heartbeat("SlideAnimationTick"); },
+            Event::AttentionPulseTick => { heartbeat("AttentionPulseTick"); },
+            Event::LoadingUiTick => { heartbeat("LoadingUiTick"); },
+            other => {
+                heartbeat(&format!("{:?}", other).chars().take(80).collect::<String>());
+            },
+        }
         match event {
             Event::MainTerminalClicked => {
                 if self.bottom_panel_focused {
@@ -4610,39 +4356,25 @@ fi
                                             self.show_hidden,
                                         ));
 
-                                        // Check if we're in a different git repo and update git status
-                                        if let Ok(repo) = Repository::discover(&dir) {
-                                            if let Some(repo_root) = repo.workdir() {
-                                                let new_repo_path = repo_root.to_path_buf();
-                                                if new_repo_path != tab.repo_path {
-                                                    // Different repo - update repo_path and refresh
-                                                    tab.repo_path = new_repo_path;
-                                                    tab.repo_name = tab
-                                                        .repo_path
-                                                        .file_name()
-                                                        .map(|n| n.to_string_lossy().to_string())
-                                                        .unwrap_or_else(|| "repo".to_string());
-                                                    tab.git_poll_interval_ms =
-                                                        GIT_POLL_FAST_INTERVAL_MS;
-                                                    tab.git_unchanged_streak = 0;
-                                                    tab.last_git_status_hash = None;
-                                                    tab.last_poll = Instant::now();
-                                                    tab.git_status_loading = true;
-                                                    let status_task = Self::request_git_status(
-                                                        tab.id,
-                                                        tab.repo_path.clone(),
-                                                    );
-                                                    pending_task = Some(
-                                                        if let Some(tree_task) = pending_task.take()
-                                                        {
-                                                            Task::batch([tree_task, status_task])
-                                                        } else {
-                                                            status_task
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                        }
+                                        // Trigger a git status refresh — the worker will
+                                        // discover the correct repo root off the main thread.
+                                        tab.repo_path = dir.clone();
+                                        tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                                        tab.git_unchanged_streak = 0;
+                                        tab.last_git_status_hash = None;
+                                        tab.last_poll = Instant::now();
+                                        tab.git_status_loading = true;
+                                        let status_task = Self::request_git_status(
+                                            tab.id,
+                                            tab.repo_path.clone(),
+                                        );
+                                        pending_task = Some(
+                                            if let Some(tree_task) = pending_task.take() {
+                                                Task::batch([tree_task, status_task])
+                                            } else {
+                                                status_task
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -4664,24 +4396,8 @@ fi
 
                 // Poll git status for the active tab with adaptive cadence.
                 if let Some(tab) = self.active_tab_mut() {
-                    // Self-heal repo root for restored sessions that may have persisted a subdir.
-                    if let Ok(repo) = Repository::discover(&tab.current_dir) {
-                        if let Some(repo_root) = repo.workdir() {
-                            let corrected = repo_root.to_path_buf();
-                            if corrected != tab.repo_path {
-                                tab.repo_path = corrected;
-                                tab.repo_name = tab
-                                    .repo_path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "repo".to_string());
-                                tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                                tab.git_unchanged_streak = 0;
-                                tab.last_git_status_hash = None;
-                                workspace_dirty = true;
-                            }
-                        }
-                    }
+                    // NOTE: repo root self-heal moved to GitStatusLoaded handler
+                    // to avoid blocking main thread with Repository::discover().
 
                     let git_focus_active =
                         tab.sidebar_mode == SidebarMode::Git || tab.selected_file.is_some();
@@ -4733,6 +4449,22 @@ fi
                 setup_menu_bar();
             }
             Event::CheckMenu => {
+                let _check_menu_start = std::time::Instant::now();
+                
+                // Detect system wake: if wall clock jumped far ahead of monotonic expectations
+                {
+                    static LAST_CHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                    if let Ok(mut last) = LAST_CHECK.lock() {
+                        if let Some(prev) = *last {
+                            let gap = prev.elapsed();
+                            if gap > Duration::from_secs(10) {
+                                freeze_debug!("WAKE DETECTED: {}s gap between CheckMenu events (system likely slept)", gap.as_secs());
+                            }
+                        }
+                        *last = Some(std::time::Instant::now());
+                    }
+                }
+                
                 // Poll for native menu events
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
                     if let Some(ids) = MENU_IDS.get() {
@@ -4754,7 +4486,10 @@ fi
                     }
                 }
 
+                let _menu_poll_elapsed = _check_menu_start.elapsed();
+                
                 // Drain console output for all workspaces
+                let _drain_start = std::time::Instant::now();
                 let mut auto_expand = false;
                 let mut console_changed = false;
                 for ws in &mut self.workspaces {
@@ -4806,9 +4541,18 @@ fi
                 if auto_expand {
                     self.console_expanded = true;
                 }
+                let _drain_elapsed = _drain_start.elapsed();
                 if console_changed {
                     self.mark_log_server_dirty();
                 }
+                let _check_menu_elapsed = _check_menu_start.elapsed();
+                if _check_menu_elapsed > Duration::from_millis(50) {
+                    freeze_debug!("CheckMenu handler took {}ms (menu_poll={}ms, console_drain={}ms)", 
+                        _check_menu_elapsed.as_millis(),
+                        _menu_poll_elapsed.as_millis(),
+                        _drain_elapsed.as_millis());
+                }
+                heartbeat("CheckMenu-done");
             }
             Event::TabSelect(idx) => {
                 if let Some(ws) = self.active_workspace_mut() {
@@ -4838,6 +4582,70 @@ fi
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
                 return self.scroll_to_active_tab();
+            }
+            Event::AgentActivityLoaded(tab_id, result) => {
+                // Find the tab by id and apply the loaded activity
+                'outer_activity: for ws in &mut self.workspaces {
+                    for tab in &mut ws.tabs {
+                        if tab.id == tab_id {
+                            tab.agent_activity_loading = false;
+                            match result {
+                                Ok(activity) => tab.agent_activity = Some(activity),
+                                Err(e) => {
+                                    eprintln!("Failed to load agent activity: {}", e);
+                                    tab.agent_activity = Some(agent::AgentActivity::new());
+                                }
+                            }
+                            break 'outer_activity;
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::AgentConversationLoaded(tab_id, conversation) => {
+                'outer_conv: for ws in &mut self.workspaces {
+                    for tab in &mut ws.tabs {
+                        if tab.id == tab_id {
+                            tab.agent_conversation = Some(conversation);
+                            break 'outer_conv;
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::SelectAgentCapture(idx) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if tab.selected_capture_idx == Some(idx) {
+                        // Deselect if clicking the same one
+                        tab.selected_capture_idx = None;
+                        tab.agent_conversation = None;
+                    } else {
+                        tab.selected_capture_idx = Some(idx);
+                        tab.agent_conversation = None; // Clear while loading
+                        // Load conversation async
+                        if let Some(activity) = &tab.agent_activity {
+                            if let Some(capture) = activity.captures.get(idx) {
+                                let capture = capture.clone();
+                                let tab_id = tab.id;
+                                return Task::perform(
+                                    async move {
+                                        match tokio::task::spawn_blocking(move || {
+                                            agent::Conversation::load_for_capture(&capture)
+                                        }).await {
+                                            Ok(conv) => (tab_id, conv),
+                                            Err(_) => (tab_id, agent::Conversation {
+                                                entries: Vec::new(),
+                                                error: Some("Failed to load conversation".to_string()),
+                                            }),
+                                        }
+                                    },
+                                    |(tab_id, conv)| Event::AgentConversationLoaded(tab_id, conv),
+                                );
+                            }
+                        }
+                    }
+                }
+                return Task::none();
             }
             Event::LaunchAgentPreset(idx) => {
                 // Option+click on "+" shows tab picker (but not if picker is already open)
@@ -5510,6 +5318,8 @@ fi
                         match mode {
                             SidebarMode::Git => {
                                 // Switching to Git mode - clear file viewer and refresh status
+                                tab.selected_capture_idx = None;
+                                tab.agent_conversation = None;
                                 tab.viewing_file_path = None;
                                 tab.file_content.clear();
                                 tab.image_handle = None;
@@ -5533,6 +5343,8 @@ fi
                             }
                             SidebarMode::Files => {
                                 // Switching to Files mode - clear git selection
+                                tab.selected_capture_idx = None;
+                                tab.agent_conversation = None;
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5550,6 +5362,8 @@ fi
                             }
                             SidebarMode::Claude => {
                                 // Switching to Claude mode - clear file viewer and git selection
+                                tab.selected_capture_idx = None;
+                                tab.agent_conversation = None;
                                 tab.viewing_file_path = None;
                                 tab.file_content.clear();
                                 tab.image_handle = None;
@@ -5568,6 +5382,29 @@ fi
                                 tab.diff_syntax_lines = None;
                                 tab.diff_syntax_notice = None;
                                 tab.fetch_claude_config();
+                            }
+                            SidebarMode::Agent => {
+                                // Switching to Agent mode - clear file viewer and git selection
+                                tab.viewing_file_path = None;
+                                tab.file_content.clear();
+                                tab.image_handle = None;
+                                tab.webview_content = None;
+                                tab.file_preview_notice = None;
+                                tab.syntax_highlight_lines = None;
+                                tab.syntax_highlight_notice = None;
+                                tab.syntax_highlight_in_progress = false;
+                                tab.syntax_highlight_requested_lines = 0;
+                                tab.file_load_in_progress = false;
+                                tab.file_load_started_at = None;
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
+                                let task = tab.fetch_agent_activity();
+                                tab.sidebar_mode = mode;
+                                return task;
                             }
                         }
                         tab.sidebar_mode = mode;
@@ -5969,33 +5806,9 @@ fi
                     let mut html_to_open = tab.webview_content.clone();
 
                     if html_to_open.is_none() {
-                        if let Some(path) = tab.viewing_file_path.as_ref() {
-                            if TabState::is_markdown_file(path) {
-                                if let Ok(content) = std::fs::read_to_string(path) {
-                                    html_to_open = Some(markdown::render_markdown_to_html(
-                                        &content,
-                                        self.theme == AppTheme::Dark,
-                                    ));
-                                }
-                            } else if TabState::is_html_file(path) {
-                                if let Ok(content) = std::fs::read_to_string(path) {
-                                    html_to_open = Some(content);
-                                }
-                            } else {
-                                #[cfg(feature = "excalidraw")]
-                                if excalidraw::is_excalidraw_file(path) {
-                                    if let Ok(content) = std::fs::read_to_string(path) {
-                                        if excalidraw::validate_excalidraw(&content) {
-                                            html_to_open =
-                                                Some(excalidraw::render_excalidraw_html(
-                                                    &content,
-                                                    self.theme == AppTheme::Dark,
-                                                ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // TODO: This should be async! Reading files synchronously on main thread
+                        // can cause UI freezes. For now, skip if no cached content available.
+                        freeze_debug!("WARNING: Skipping browser open - no cached content (file would be read on main thread)");
                     }
 
                     if let Some(html) = &html_to_open {
@@ -6059,6 +5872,8 @@ fi
                 }
                 // Signal the log server to shut down
                 self.log_server_state.shutdown.notify_one();
+                // Clean up instance-specific configuration
+                config::cleanup_instance_config();
                 // Close the window
                 return iced::window::oldest().then(|opt_id| {
                     if let Some(id) = opt_id {
@@ -6107,26 +5922,23 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     tab.git_status_loading = false;
-                    if tab.repo_path == snapshot.repo_path {
-                        // Guard against transient false negatives from background tasks:
-                        // if discover() succeeds for the current path, keep git state.
-                        let still_git = Repository::discover(&tab.repo_path).is_ok();
-
-                        if snapshot.is_git_repo {
-                            tab.repo_name = snapshot.repo_name;
-                            tab.branch_name = snapshot.branch_name;
-                            tab.is_git_repo = true;
-                            tab.staged = snapshot.staged;
-                            tab.unstaged = snapshot.unstaged;
-                            tab.untracked = snapshot.untracked;
-                        } else if !still_git {
-                            tab.is_git_repo = false;
-                            tab.staged = snapshot.staged;
-                            tab.unstaged = snapshot.unstaged;
-                            tab.untracked = snapshot.untracked;
-                        } else {
-                            tab.is_git_repo = true;
+                    {
+                        // Self-heal: if the worker discovered a different repo root, update
+                        if snapshot.repo_path != tab.repo_path && snapshot.is_git_repo {
+                            tab.repo_path = snapshot.repo_path.clone();
+                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                            tab.git_unchanged_streak = 0;
+                            tab.last_git_status_hash = None;
                         }
+
+                        // Apply the git status from the worker (which already ran
+                        // Repository::discover off the main thread)
+                        tab.repo_name = snapshot.repo_name;
+                        tab.branch_name = snapshot.branch_name;
+                        tab.is_git_repo = snapshot.is_git_repo;
+                        tab.staged = snapshot.staged;
+                        tab.unstaged = snapshot.unstaged;
+                        tab.untracked = snapshot.untracked;
 
                         let effective_hash = git_tab_state_hash(tab);
                         let unchanged = tab.last_git_status_hash == Some(effective_hash);
@@ -7005,10 +6817,11 @@ fi
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let spine = self.view_spine();
-        let tab_bar = self.view_tab_bar();
-        let content = self.view_workspace_slide();
-        let console_panel = self.view_bottom_panel();
+        heartbeat("view");
+        let spine = freeze_time!("view_spine", { self.view_spine() });
+        let tab_bar = freeze_time!("view_tab_bar", { self.view_tab_bar() });
+        let content = freeze_time!("view_workspace_slide", { self.view_workspace_slide() });
+        let console_panel = freeze_time!("view_bottom_panel", { self.view_bottom_panel() });
 
         let mut main_col = Column::new()
             .spacing(0)
@@ -7783,7 +7596,7 @@ fi
                         display.to_string()
                     };
                     if display.len() > 20 {
-                        format!("{}…", &display[..19])
+                        format!("{}…", truncate_str(&display, 19))
                     } else {
                         display
                     }
@@ -8079,12 +7892,14 @@ fi
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
-            let main_panel = if tab.viewing_file_path.is_some() {
-                self.view_file_content(tab)
+            let main_panel = if tab.selected_capture_idx.is_some() && tab.sidebar_mode == SidebarMode::Agent {
+                freeze_time!("view_agent_conversation", { self.view_agent_conversation(tab) })
+            } else if tab.viewing_file_path.is_some() {
+                freeze_time!("view_file_content", { self.view_file_content(tab) })
             } else if tab.selected_file.is_some() {
-                self.view_diff_panel(tab)
+                freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
             } else {
-                self.view_terminal(tab)
+                freeze_time!("view_terminal", { self.view_terminal(tab) })
             };
 
             if self.sidebar_collapsed {
@@ -8104,7 +7919,7 @@ fi
                     .height(Length::Fill)
                     .into()
             } else {
-                let sidebar = self.view_sidebar(tab);
+                let sidebar = freeze_time!("view_sidebar", { self.view_sidebar(tab) });
 
                 // Draggable divider
                 let divider_color = if self.dragging_divider {
@@ -8245,9 +8060,10 @@ fi
 
         // Content based on mode
         let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
-            SidebarMode::Git => self.view_git_list(tab),
-            SidebarMode::Files => self.view_file_tree(tab),
-            SidebarMode::Claude => self.view_claude_sidebar(tab),
+            SidebarMode::Git => freeze_time!("view_git_list", { self.view_git_list(tab) }),
+            SidebarMode::Files => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            SidebarMode::Claude => freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) }),
+            SidebarMode::Agent => freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) }),
         };
 
         content = content.push(mode_content);
@@ -8444,6 +8260,7 @@ fi
         let git_active = tab.sidebar_mode == SidebarMode::Git;
         let files_active = tab.sidebar_mode == SidebarMode::Files;
         let claude_active = tab.sidebar_mode == SidebarMode::Claude;
+        let _agent_active = tab.sidebar_mode == SidebarMode::Agent;
 
         // Git tab label with optional badge
         let git_text_color = if git_active {
@@ -8519,7 +8336,20 @@ fi
         .padding([4, 4])
         .on_press(Event::ToggleSidebar);
 
-        let tab_row = container(row![git_tab, files_tab, claude_tab, collapse_chevron].spacing(0))
+        // Agent tab
+        let agent_active = tab.sidebar_mode == SidebarMode::Agent;
+        let agent_text_color = if agent_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+        let agent_tab = self.view_sidebar_tab(
+            text("Agent").size(font).color(agent_text_color).into(),
+            agent_active,
+            Event::SetSidebarMode(SidebarMode::Agent),
+        );
+
+        let tab_row = container(row![git_tab, files_tab, claude_tab, agent_tab, collapse_chevron].spacing(0))
             .padding([4, 4])
             .width(Length::Fill)
             .style(move |_| container::Style {
@@ -8545,6 +8375,12 @@ fi
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
+        
+        // Debug large file trees
+        if tab.file_tree.len() > 500 {
+            freeze_debug!("Large file tree with {} entries in view_file_tree", tab.file_tree.len());
+        }
+        
         let mut content = Column::new().spacing(2).padding(8);
 
         // Current path - show relative to repo if inside it, otherwise show with ~ for home
@@ -8564,20 +8400,10 @@ fi
             format!("{}/", tab.current_dir.display())
         };
 
-        // Path and hidden toggle
-        let hidden_label = if self.show_hidden {
-            "Hide .*"
-        } else {
-            "Show .*"
-        };
+        // Path display
         content = content.push(
             row![
                 text(path_display).size(font).color(theme.accent()),
-                iced::widget::Space::new().width(Length::Fill),
-                button(text(hidden_label).size(font_small))
-                    .style(button::text)
-                    .padding([2, 6])
-                    .on_press(Event::ToggleHidden),
             ]
             .padding([4, 0])
             .align_y(iced::Alignment::Center),
@@ -8726,6 +8552,594 @@ fi
         scrollable(content)
             .height(Length::Fill)
             .width(Length::Fill)
+            .into()
+    }
+
+    fn view_agent_sidebar<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        
+        if tab.agent_activity_loading {
+            let spinner = container(
+                text("Loading agent activity...")
+                    .size(font_small)
+                    .color(theme.subtext0())
+            )
+            .padding(20)
+            .center_x(Length::Fill);
+            
+            return spinner.into();
+        }
+
+        let activity = match &tab.agent_activity {
+            Some(activity) => activity,
+            None => {
+                let no_data = container(
+                    column![
+                        text("No Agent Activity")
+                            .size(font)
+                            .color(theme.text_primary()),
+                        text("No captured sessions found for this repository")
+                            .size(font_small)
+                            .color(theme.subtext0())
+                    ]
+                    .spacing(4)
+                )
+                .padding(20)
+                .center_x(Length::Fill);
+                
+                return no_data.into();
+            }
+        };
+
+        let mut content = Column::new().spacing(0);
+
+        // Header with overview stats
+        let header_bg = theme.surface0();
+        let accent_glow = iced::Color {
+            a: 0.1,
+            ..theme.mauve()
+        };
+        
+        let commits_count = activity.total_commits;
+        let live_count = activity.live_capture_count();
+        let git_count = commits_count - live_count;
+        let cost_display = activity.format_total_cost();
+        
+        let mut stats_row = Row::new().spacing(8);
+        
+        // Agent sessions badge (live captures)
+        if live_count > 0 {
+            stats_row = stats_row.push(
+                container(
+                    text(format!("{} sessions", live_count))
+                        .size(font_small)
+                        .color(theme.mauve())
+                )
+                .padding([2, 8])
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.15, ..theme.mauve() }.into()),
+                    border: iced::Border::default().rounded(8),
+                    ..Default::default()
+                })
+            );
+        }
+        
+        // Git commits badge (reconstructed)
+        if git_count > 0 {
+            stats_row = stats_row.push(
+                container(
+                    text(format!("{} commits", git_count))
+                        .size(font_small)
+                        .color(theme.overlay1())
+                )
+                .padding([2, 8])
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.12, ..theme.overlay1() }.into()),
+                    border: iced::Border::default().rounded(8),
+                    ..Default::default()
+                })
+            );
+        }
+        
+        // Cost badge (only if there are live captures with cost)
+        if activity.total_cost > 0.0 {
+            stats_row = stats_row.push(
+                container(
+                    text(cost_display)
+                        .size(font_small)
+                        .color(theme.peach())
+                )
+                .padding([2, 8])
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.15, ..theme.peach() }.into()),
+                    border: iced::Border::default().rounded(8),
+                    ..Default::default()
+                })
+            );
+        }
+        
+        let header_stats = container(
+            column![
+                text("Agent Activity Journal")
+                    .size(font)
+                    .color(theme.text_primary()),
+                stats_row
+            ]
+            .spacing(6)
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(header_bg.into()),
+            border: iced::Border {
+                width: 1.0,
+                color: accent_glow,
+                radius: iced::border::Radius::from(6),
+            },
+            ..Default::default()
+        });
+
+        content = content.push(header_stats);
+        content = content.push(iced::widget::Space::new().height(8));
+
+        // Recent captures timeline
+        if activity.captures.is_empty() {
+            let empty_state = container(
+                column![
+                    text("✨ Ready for your first agent session")
+                        .size(font)
+                        .color(theme.subtext1()),
+                    text("Commit with an agent to see activity here")
+                        .size(font_small)
+                        .color(theme.subtext0())
+                ]
+                .spacing(4)
+                .align_x(iced::Alignment::Center)
+            )
+            .padding(20)
+            .width(Length::Fill)
+            .center_x(Length::Fill);
+            
+            content = content.push(empty_state);
+        } else {
+            // Show recent captures
+            let recent_captures = activity.recent_captures(50);
+            let selected_idx = tab.selected_capture_idx;
+            
+            for (idx, capture) in recent_captures.iter().enumerate() {
+                let is_selected = selected_idx == Some(idx);
+                content = content.push(self.view_agent_capture_entry(capture, theme, idx, is_selected));
+            }
+        }
+
+        scrollable(content).into()
+    }
+
+    fn view_agent_capture_entry<'a>(
+        &'a self,
+        capture: &'a agent::AgentCapture,
+        theme: &'a AppTheme,
+        idx: usize,
+        is_selected: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let font_small = self.ui_font_small();
+        let font_tiny = font_small * 0.9;
+
+        let is_reconstructed = capture.is_reconstructed();
+        let is_live = !is_reconstructed;
+
+        // Container styling — highlight selected
+        let entry_bg = if is_selected {
+            theme.surface0()
+        } else if is_reconstructed {
+            theme.bg_base()
+        } else {
+            theme.bg_overlay()
+        };
+        let border_color = if is_selected {
+            theme.accent()
+        } else if is_reconstructed {
+            theme.surface0()
+        } else {
+            theme.surface1()
+        };
+
+        // Format timestamp
+        let time_display = if let Some(timestamp) = capture.timestamp_parsed() {
+            let elapsed = timestamp.elapsed().unwrap_or(Duration::from_secs(0));
+            let secs = elapsed.as_secs();
+            if secs >= 24 * 3600 {
+                format!("{}d", secs / (24 * 3600))
+            } else if secs >= 3600 {
+                format!("{}h", secs / 3600)
+            } else {
+                format!("{}m", secs / 60)
+            }
+        } else {
+            "now".to_string()
+        };
+
+        let mut entry_content = Column::new().spacing(2);
+
+        // === Row 1: Description (the most important thing) ===
+        if let Some(desc) = capture.description() {
+            let truncated: String = if desc.len() > 72 {
+                format!("{}…", truncate_str(&desc, 71))
+            } else {
+                desc
+            };
+            let desc_color = if is_live { theme.text_primary() } else { theme.subtext1() };
+            entry_content = entry_content.push(
+                text(truncated).size(font_small).color(desc_color)
+            );
+        }
+
+        // === Row 2: Badges row — hash, type badge, key stat, timestamp ===
+        let mut badges_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+
+        // Commit hash
+        let hash_color = if is_live { theme.blue() } else { theme.overlay0() };
+        badges_row = badges_row.push(
+            text(capture.short_hash()).size(font_tiny).color(hash_color)
+        );
+
+        if is_live {
+            // Model badge
+            let (model_name, model_badge_color) = if let Some((name, _)) = capture.primary_model() {
+                let color = if name.contains("opus") {
+                    theme.mauve()
+                } else if name.contains("sonnet") {
+                    theme.blue()
+                } else if name.contains("haiku") {
+                    theme.green()
+                } else if name.contains("gpt") {
+                    theme.green()
+                } else {
+                    theme.overlay1()
+                };
+                // Short name: "opus-4-6" from "claude-opus-4-6"
+                let short = name.split('/').last().unwrap_or(name);
+                let short = short.strip_prefix("claude-").unwrap_or(short);
+                (short, color)
+            } else {
+                ("unknown", theme.overlay1())
+            };
+            badges_row = badges_row.push(
+                container(
+                    text(model_name).size(font_tiny).color(model_badge_color)
+                )
+                .padding([1, 5])
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.15, ..model_badge_color }.into()),
+                    border: iced::Border::default().rounded(4),
+                    ..Default::default()
+                })
+            );
+
+            // Turns count
+            badges_row = badges_row.push(
+                text(format!("{}t", capture.turns)).size(font_tiny).color(theme.subtext0())
+            );
+
+            // Duration
+            badges_row = badges_row.push(
+                text(capture.format_duration()).size(font_tiny).color(theme.subtext0())
+            );
+        } else {
+            // Git badge for reconstructed
+            let git_color = theme.overlay1();
+            badges_row = badges_row.push(
+                container(
+                    text("git").size(font_tiny).color(git_color)
+                )
+                .padding([1, 5])
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.12, ..git_color }.into()),
+                    border: iced::Border::default().rounded(4),
+                    ..Default::default()
+                })
+            );
+
+            // Diff summary
+            let diff = capture.diff_summary();
+            if !diff.is_empty() {
+                badges_row = badges_row.push(
+                    text(diff).size(font_tiny).color(theme.overlay0())
+                );
+            }
+        }
+
+        // Timestamp pushed to the right
+        badges_row = badges_row.push(iced::widget::Space::new().width(Length::Fill));
+        badges_row = badges_row.push(
+            text(time_display).size(font_tiny).color(theme.overlay0())
+        );
+
+        entry_content = entry_content.push(badges_row);
+
+        let entry_container = container(entry_content)
+            .padding([6, 12])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(entry_bg.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: border_color,
+                    radius: iced::border::Radius::from(4),
+                },
+                ..Default::default()
+            });
+
+        // Only make live captures clickable (they have conversations)
+        if is_live {
+            iced::widget::mouse_area(entry_container)
+                .on_press(Event::SelectAgentCapture(idx))
+                .into()
+        } else {
+            entry_container.into()
+        }
+    }
+
+    fn view_agent_conversation<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let font_tiny = font_small * 0.9;
+
+        let conversation = match &tab.agent_conversation {
+            Some(c) => c,
+            None => {
+                return container(
+                    text("Select a session to view its conversation")
+                        .size(font_small)
+                        .color(theme.subtext0())
+                )
+                .padding(20)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
+            }
+        };
+
+        // Get capture info for the header
+        let capture = tab.selected_capture_idx
+            .and_then(|idx| tab.agent_activity.as_ref()?.captures.get(idx));
+
+        let mut content = Column::new().spacing(0);
+
+        // Header with capture info
+        if let Some(cap) = capture {
+            let header_bg = theme.surface0();
+            let desc = cap.description().unwrap_or_else(|| cap.short_hash().to_string());
+            let desc_truncated: String = if desc.len() > 80 {
+                format!("{}…", truncate_str(&desc, 79))
+            } else {
+                desc
+            };
+
+            let mut header_col = Column::new().spacing(4);
+            header_col = header_col.push(
+                text(desc_truncated).size(font).color(theme.text_primary())
+            );
+
+            // Stats line
+            let mut stats_parts = Vec::new();
+            stats_parts.push(cap.short_hash().to_string());
+            if let Some((name, _)) = cap.primary_model() {
+                let short = name.split('/').last().unwrap_or(name);
+                let short = short.strip_prefix("claude-").unwrap_or(short);
+                stats_parts.push(short.to_string());
+            }
+            stats_parts.push(format!("{}t", cap.turns));
+            stats_parts.push(cap.format_duration());
+            stats_parts.push(cap.format_cost());
+            
+            header_col = header_col.push(
+                text(stats_parts.join(" · ")).size(font_tiny).color(theme.subtext0())
+            );
+
+            content = content.push(
+                container(header_col)
+                    .padding([10, 16])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(header_bg.into()),
+                        ..Default::default()
+                    })
+            );
+        }
+
+        // Error state
+        if let Some(err) = &conversation.error {
+            content = content.push(
+                container(
+                    text(err).size(font_small).color(theme.subtext0())
+                )
+                .padding([16, 16])
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+            );
+            return scrollable(content).width(Length::Fill).height(Length::Fill).into();
+        }
+
+        if conversation.entries.is_empty() {
+            content = content.push(
+                container(
+                    text("No conversation entries found").size(font_small).color(theme.subtext0())
+                )
+                .padding([16, 16])
+                .width(Length::Fill)
+            );
+            return scrollable(content).width(Length::Fill).height(Length::Fill).into();
+        }
+
+        // Render conversation entries
+        let mut thread = Column::new().spacing(2).padding([8, 12]);
+
+        for entry in &conversation.entries {
+            match entry {
+                agent::ConversationEntry::User { text: user_text } => {
+                    let user_color = theme.blue();
+                    let bg = iced::Color { a: 0.08, ..user_color };
+                    
+                    let display_text: String = if user_text.len() > 500 {
+                        format!("{}…", truncate_str(user_text, 497))
+                    } else {
+                        user_text.clone()
+                    };
+                    
+                    thread = thread.push(
+                        container(
+                            column![
+                                text("You").size(font_tiny).color(user_color),
+                                text(display_text).size(font_small).color(theme.text_primary())
+                            ]
+                            .spacing(2)
+                        )
+                        .padding([8, 12])
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border {
+                                width: 0.0,
+                                color: iced::Color::TRANSPARENT,
+                                radius: iced::border::Radius::from(6),
+                            },
+                            ..Default::default()
+                        })
+                    );
+                }
+                agent::ConversationEntry::Assistant { text: asst_text, model } => {
+                    let model_short = model.strip_prefix("claude-").unwrap_or(model);
+                    let asst_color = theme.mauve();
+                    let bg = iced::Color { a: 0.05, ..asst_color };
+                    
+                    let display_text: String = if asst_text.len() > 1000 {
+                        format!("{}…", truncate_str(asst_text, 997))
+                    } else {
+                        asst_text.clone()
+                    };
+                    
+                    thread = thread.push(
+                        container(
+                            column![
+                                text(model_short).size(font_tiny).color(asst_color),
+                                text(display_text).size(font_small).color(theme.text_secondary())
+                            ]
+                            .spacing(2)
+                        )
+                        .padding([8, 12])
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border {
+                                width: 0.0,
+                                color: iced::Color::TRANSPARENT,
+                                radius: iced::border::Radius::from(6),
+                            },
+                            ..Default::default()
+                        })
+                    );
+                }
+                agent::ConversationEntry::ToolCall { tool, summary } => {
+                    let tool_color = theme.yellow();
+                    
+                    let label = format!("→ {} {}", tool, summary);
+                    let label_truncated: String = if label.len() > 100 {
+                        format!("{}…", truncate_str(&label, 97))
+                    } else {
+                        label
+                    };
+                    
+                    thread = thread.push(
+                        container(
+                            text(label_truncated).size(font_tiny).color(tool_color)
+                        )
+                        .padding([3, 12])
+                    );
+                }
+                agent::ConversationEntry::ToolResult { tool: _, output, is_error } => {
+                    if !output.is_empty() {
+                        let result_color = if *is_error { theme.red() } else { theme.overlay1() };
+                        let prefix = if *is_error { "✗ " } else { "" };
+                        let bg = if *is_error {
+                            iced::Color { a: 0.06, ..theme.red() }
+                        } else {
+                            theme.bg_base()
+                        };
+                        
+                        // Only show first few lines of output
+                        let lines: Vec<&str> = output.lines().take(6).collect();
+                        let display = if output.lines().count() > 6 {
+                            format!("{}{}…", prefix, lines.join("\n"))
+                        } else {
+                            format!("{}{}", prefix, lines.join("\n"))
+                        };
+                        
+                        thread = thread.push(
+                            container(
+                                text(display).size(font_tiny).color(result_color)
+                            )
+                            .padding([4, 12])
+                            .width(Length::Fill)
+                            .style(move |_| container::Style {
+                                background: Some(bg.into()),
+                                border: iced::Border {
+                                    width: 0.0,
+                                    color: iced::Color::TRANSPARENT,
+                                    radius: iced::border::Radius::from(4),
+                                },
+                                ..Default::default()
+                            })
+                        );
+                    }
+                }
+                agent::ConversationEntry::Thinking { text: think_text } => {
+                    let think_color = theme.overlay0();
+                    let display: String = if think_text.len() > 300 {
+                        format!("💭 {}…", truncate_str(think_text, 297))
+                    } else {
+                        format!("💭 {}", think_text)
+                    };
+                    
+                    thread = thread.push(
+                        container(
+                            text(display).size(font_tiny).color(think_color)
+                        )
+                        .padding([3, 12])
+                    );
+                }
+                agent::ConversationEntry::Compaction { summary } => {
+                    let compact_color = theme.peach();
+                    let display: String = if summary.len() > 200 {
+                        format!("⟳ Context compacted: {}…", truncate_str(summary, 197))
+                    } else {
+                        format!("⟳ Context compacted: {}", summary)
+                    };
+                    
+                    thread = thread.push(
+                        container(
+                            text(display).size(font_tiny).color(compact_color)
+                        )
+                        .padding([6, 12])
+                    );
+                }
+            }
+        }
+
+        content = content.push(thread);
+
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 
@@ -9974,6 +10388,14 @@ fi
         // Only show the loading banner for the initial fetch. Subsequent polls refresh in place
         // to avoid visible flashing in the Git list.
         let show_loading = tab.git_status_loading && tab.last_git_status_hash.is_none();
+        
+        // Debug large git status results
+        let total_files = tab.staged.len() + tab.unstaged.len() + tab.untracked.len();
+        if total_files > 1000 {
+            freeze_debug!("Large git status with {} files ({} staged, {} unstaged, {} untracked) in view_git_list", 
+                total_files, tab.staged.len(), tab.unstaged.len(), tab.untracked.len());
+        }
+        
         let mut content = Column::new().spacing(8).padding(8);
 
         // Branch display - styled rounded container with diamond icon

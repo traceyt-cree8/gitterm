@@ -1,0 +1,30 @@
+--- Debug patch for GitTerm freeze investigation ---
+
+1. Add timing logs around blocking operations
+2. Add fallback detection for spawn_blocking failures  
+3. Add file size warnings before reading large files
+
+Apply this patch to add debug logging:
+
+```rust
+// In collect_git_status function - add timing
+let start = std::time::Instant::now();
+// ... existing git operations ...
+let elapsed = start.elapsed();
+if elapsed > Duration::from_millis(100) {
+    eprintln!("[FREEZE-DEBUG] Git status took {}ms for {}", 
+             elapsed.as_millis(), repo_path.display());
+}
+
+// In request_git_status - detect fallback usage  
+Err(err) => {
+    eprintln!("[FREEZE-DEBUG] spawn_blocking FAILED! Running git ops on main thread: {}", err);
+    collect_git_status(tab_id, fallback_repo_path)
+}
+
+// Before file reads - check size
+let file_size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+if file_size > 1_000_000 { // 1MB
+    eprintln!("[FREEZE-DEBUG] Reading large file ({} bytes): {}", file_size, path.display());
+}
+```

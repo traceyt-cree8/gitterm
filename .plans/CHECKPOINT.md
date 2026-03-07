@@ -1,46 +1,29 @@
 # Checkpoint: gitterm-v2
 
-**Last checkpoint:** 2026-03-01 09:20 AM PST
+**Last checkpoint:** Friday, March 6, 2026 at 06:36 AM PST
 
 ## You Were Just Working On
-Building an agent-capture system for GitTerm — a pi extension that silently captures structured metadata on every git commit, as the foundation for Entire.io-style agent-aware version control features.
+Performance optimization of git status polling — reduced from 3 sequential git process spawns to 1 by switching to `--porcelain=v2 --branch` format and adding `--no-optional-locks`.
 
-**Just did:** Committed docs (Entire.io research + performance tuning) and set up pi-config repo under source control
-**Immediate next step:** Design the experience layer for viewing captured agent session data — either in GitTerm's UI or a separate tool. The capture pipeline is complete and running; now decide how to surface the data.
+**Just did:** Rewrote `collect_git_status` in `src/services.rs` to use a single `git status --porcelain=v2 --branch --no-renames --no-optional-locks` command instead of 3 separate git commands.
+**Immediate next step:** Test the git status performance improvement on the `producer-fresh` repo — verify times drop from 200-400ms to under 100ms, and confirm branch name + file status parsing works correctly with the v2 porcelain format.
 
 ## Completed This Session
-- Researched Entire.io (GitHub wrapper with Trails, Checkpoints, agent attribution) and documented findings in `docs/ENTIRE-IO-RESEARCH.md`
-- Identified GitTerm's competitive advantage: it owns the terminal where agents run, enabling real-time capture vs post-hoc reconstruction
-- Designed a two-layer data shape: Layer 1 (mechanical, instant) captured at commit time; Layer 2 (LLM-generated insights) deferred for later
-- Built `agent-capture.ts` pi extension that hooks `tool_execution_end`, detects git commits, and writes structured JSONL
-- Iterated on the capture shape across multiple test cycles:
-  - v1: basic commit/branch/repo/models/files/tokens/cost/duration
-  - v2: split duration into `wall_clock_seconds` + `agent_active_seconds` (tracks turn durations)
-  - v3: added `user_prompts` (count + actual text) and `errors` (count + recovered)
-  - v4: added `billing` field ("sub" | "api") by discovering `modelRegistry.isUsingOAuth()`, renamed `cost_usd` to `estimated_api_cost_usd`
-- Decided capture range tracks between commits (not per-prompt), so multi-prompt work toward a single commit is captured together
-- Created `~/GitRepo/pi-config/` repo to put all pi customizations under source control
-- Built `install.sh` that symlinks extensions, prompts, themes, skills, settings, presets, and memory from the repo into `~/.pi/agent/`
-- Verified symlinks work — extensions load and fire through them
-- Committed all pi config: 7 extensions, 4 prompts, 6 themes, settings, presets, memory
-- Reviewed project-local skills (port-ui, coordinator) — decided they stay project-local, not worth generalizing yet
+- Removed dot-file/dot-folder filtering from file explorer — files starting with `.` now always shown (`src/main.rs` and `src/services.rs`)
+- Removed the "Show .*" / "Hide .*" toggle button from file explorer sidebar UI (`src/main.rs`)
+- Optimized `collect_git_status` in `src/services.rs`: consolidated 3 git process spawns into 1 using `--porcelain=v2 --branch`
+- Added `--no-optional-locks` flag to reduce lock contention with concurrent git operations (e.g., Claude Code)
+- Made repo root discovery (`rev-parse --show-toplevel`) conditional — only runs when `.git` dir not found at repo_path (self-heal case)
+- Both changes compile cleanly
 
 ## Active Plan
-No active plan file. Working towards an agent-aware version control system for GitTerm:
-1. ✅ **Capture pipeline** — complete, running silently on every commit
-2. ⬜ **Experience layer** — how to view/query the captured data (GitTerm sidebar? separate tool? CLI?)
-3. ⬜ **Layer 2 insights** — LLM-generated summaries, intent extraction, shareable artifacts
-4. ⬜ **Trails** — enhanced issue/PR workflow (future phase)
-5. ⬜ **Review workflow** — inline reviews, approvals (future phase)
+No active plan file found. Work was driven by user-reported issues: missing dot folders in file explorer and slow git status polling (200-400ms per poll on producer-fresh repo).
 
 ## Key Files
-- `~/.pi/agent/extensions/agent-capture.ts` → `~/GitRepo/pi-config/extensions/agent-capture.ts` — The capture extension, hooks git commits and writes JSONL
-- `~/.config/gitterm/captures/{repo}/log.jsonl` — Where captured data accumulates (per-repo)
-- `docs/ENTIRE-IO-RESEARCH.md` — Full research doc with feature mapping and competitive analysis
-- `~/GitRepo/pi-config/install.sh` — Pi config installer (symlinks everything)
-- `~/GitRepo/pi-config/extensions/` — All 7 global pi extensions under source control
+- `src/services.rs` — Contains `collect_git_status()` and `collect_file_tree()` — the two functions modified this session
+- `src/main.rs` — Main app file (~3300 lines), removed dot-file filter in `fetch_file_tree()` and removed toggle button UI
+- `src/config.rs` — Config persistence, still has `show_hidden` field (now unused but harmless for backward compat)
 
 ## Blockers/Issues
-- File tracking in captures only records pi tool usage (read/edit/write), not files modified via bash commands — acceptable since git diff covers that
-- Capture uses `ctx.cwd` for repo slug, so commits in other repos via `cd` in bash get filed under the wrong repo — edge case, acceptable for now
-- Layer 2 (LLM-generated insights) not yet designed — needs decisions on when/how to generate summaries and whether to use local models or the active agent
+- The `show_hidden` field/plumbing still exists in config, state, and events (e.g., `Event::ToggleHidden`, `self.show_hidden`) — it's dead code now but not cleaned up. Low priority.
+- Git status performance improvement is untested on the actual slow repo (`producer-fresh`) — need to verify the v2 porcelain format parsing handles all edge cases (renames, unmerged files, detached HEAD).
