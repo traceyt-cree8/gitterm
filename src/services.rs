@@ -3,7 +3,7 @@ use crate::excalidraw;
 use crate::markdown;
 use crate::{
     add_word_diffs_to_lines, build_syntax_highlight_lines, format_bytes, read_text_preview,
-    status_char, DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot,
+    DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot,
     FileSyntaxSnapshot, FileTreeEntry, FileTreeSnapshot, FileVersionSignature, GitStatusSnapshot,
     TabState, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
     MAX_INLINE_WEBVIEW_BYTES,
@@ -24,6 +24,7 @@ const MAX_UNTRACKED_DIFF_PREVIEW_LINES: usize = 3000;
 
 pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
     let started = Instant::now();
+    
     let mut snapshot = GitStatusSnapshot {
         tab_id,
         repo_name: repo_path
@@ -38,72 +39,212 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
         untracked: Vec::new(),
     };
 
-    if let Ok(repo) = Repository::open(&repo_path).or_else(|_| Repository::discover(&repo_path)) {
-        snapshot.is_git_repo = true;
-        if let Ok(head) = repo.head() {
-            if let Some(name) = head.shorthand() {
-                snapshot.branch_name = name.to_string();
-            }
+    // Use native git CLI — faster than git2 because it uses fsmonitor,
+    // split index, untracked cache, and other optimizations.
+    //
+    // Single command: `git status --porcelain=v2 --branch --no-renames --no-optional-locks`
+    // This gives us branch info + file status in one process spawn.
+    // --no-optional-locks avoids contention with other git processes (e.g. Claude Code).
+    let cli_result = std::process::Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+        ])
+        .current_dir(&repo_path)
+        .output();
+
+    // If git binary isn't found, fall back to git2 library.
+    // If git ran but returned non-zero, the directory isn't a git repo — don't bother with git2.
+    let output = match cli_result {
+        Ok(o) if o.status.success() => o,
+        Ok(_) => return snapshot, // git ran, not a git repo
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return collect_git_status_git2(snapshot, &repo_path);
         }
-
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true)
-            // Avoid deep recursion in large/generated directories; this keeps git
-            // polling responsive while still surfacing untracked directories.
-            .recurse_untracked_dirs(false)
-            .include_ignored(false)
-            .exclude_submodules(true)
-            .include_unmodified(false)
-            .renames_head_to_index(false)
-            .renames_index_to_workdir(false);
-
-        if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
-            for entry in statuses.iter() {
-                let path = entry.path().unwrap_or("").to_string();
-                let status = entry.status();
-
-                if status.contains(Status::INDEX_NEW)
-                    || status.contains(Status::INDEX_MODIFIED)
-                    || status.contains(Status::INDEX_DELETED)
-                    || status.contains(Status::INDEX_RENAMED)
-                {
-                    snapshot.staged.push(FileEntry {
-                        path: path.clone(),
-                        status: status_char(status, true),
-                        is_staged: true,
-                    });
+        Err(_) => return snapshot,
+    };
+    
+    snapshot.is_git_repo = true;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.starts_with("# branch.head ") {
+            // Parse branch name from v2 header ("# branch.head " is 14 chars)
+            let branch = line[14..].trim();
+            if !branch.is_empty() && branch != "(detached)" {
+                snapshot.branch_name = branch.to_string();
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            // Changed entries: "1 XY sub mH mI mW hH hI path"
+            // or rename:       "2 XY sub mH mI mW hH hI X### path\torigPath"
+            let bytes = line.as_bytes();
+            if bytes.len() < 5 { continue; }
+            let index_status = bytes[2];
+            let worktree_status = bytes[3];
+            
+            // Path is the last space-separated field (field 9 for type 1, field 10 for type 2)
+            // For type 1: split by space, take index 8+
+            // For type 2: split by tab first to handle renames, then space
+            let path = if line.starts_with("2 ") {
+                // Rename: "2 XY ... X### path\torigPath"
+                line.split('\t').next()
+                    .and_then(|before_tab| before_tab.rsplitn(2, ' ').next())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                // Regular: "1 XY ... path" — path is everything after 8th space
+                let mut space_count = 0;
+                let mut path_start = 0;
+                for (i, b) in bytes.iter().enumerate() {
+                    if *b == b' ' {
+                        space_count += 1;
+                        if space_count == 8 {
+                            path_start = i + 1;
+                            break;
+                        }
+                    }
                 }
-
-                if status.contains(Status::WT_MODIFIED)
-                    || status.contains(Status::WT_DELETED)
-                    || status.contains(Status::WT_RENAMED)
-                {
-                    snapshot.unstaged.push(FileEntry {
-                        path: path.clone(),
-                        status: status_char(status, false),
-                        is_staged: false,
-                    });
+                if path_start > 0 && path_start < bytes.len() {
+                    String::from_utf8_lossy(&bytes[path_start..]).to_string()
+                } else {
+                    continue;
                 }
-
-                if status.contains(Status::WT_NEW) {
-                    snapshot.untracked.push(FileEntry {
-                        path,
-                        status: "?".to_string(),
-                        is_staged: false,
-                    });
+            };
+            
+            if path.is_empty() { continue; }
+            
+            // Staged changes (index column)
+            match index_status {
+                b'A' => snapshot.staged.push(FileEntry {
+                    path: path.clone(), status: "A".to_string(), is_staged: true,
+                }),
+                b'M' => snapshot.staged.push(FileEntry {
+                    path: path.clone(), status: "M".to_string(), is_staged: true,
+                }),
+                b'D' => snapshot.staged.push(FileEntry {
+                    path: path.clone(), status: "D".to_string(), is_staged: true,
+                }),
+                b'R' => snapshot.staged.push(FileEntry {
+                    path: path.clone(), status: "R".to_string(), is_staged: true,
+                }),
+                _ => {}
+            }
+            
+            // Unstaged changes (worktree column)
+            match worktree_status {
+                b'M' => snapshot.unstaged.push(FileEntry {
+                    path: path.clone(), status: "M".to_string(), is_staged: false,
+                }),
+                b'D' => snapshot.unstaged.push(FileEntry {
+                    path: path.clone(), status: "D".to_string(), is_staged: false,
+                }),
+                _ => {}
+            }
+        } else if line.starts_with("? ") {
+            // Untracked: "? path"
+            let path = line[2..].to_string();
+            snapshot.untracked.push(FileEntry {
+                path, status: "?".to_string(), is_staged: false,
+            });
+        }
+        // Skip "u " (unmerged) and other header lines for now
+    }
+    
+    // Self-heal repo path: check if .git exists at repo_path, otherwise discover root
+    if !repo_path.join(".git").exists() {
+        if let Ok(toplevel_output) = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel", "--no-optional-locks"])
+            .current_dir(&repo_path)
+            .output()
+        {
+            if toplevel_output.status.success() {
+                let root = String::from_utf8_lossy(&toplevel_output.stdout).trim().to_string();
+                let root_path = PathBuf::from(root);
+                if root_path != repo_path {
+                    snapshot.repo_path = root_path;
+                    snapshot.repo_name = snapshot.repo_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "repo".to_string());
                 }
             }
         }
     }
 
+    let elapsed = started.elapsed();
     perf_log!(
         "git_status tab={} repo={} git={} changed={} took={}ms",
         tab_id,
         repo_path.display(),
         snapshot.is_git_repo,
         snapshot.staged.len() + snapshot.unstaged.len() + snapshot.untracked.len(),
-        started.elapsed().as_millis()
+        elapsed.as_millis()
     );
+    
+    if elapsed > std::time::Duration::from_millis(200) {
+        eprintln!("[FREEZE-DEBUG] Git status took {}ms for {} on thread '{}'", 
+                 elapsed.as_millis(), 
+                 repo_path.display(),
+                 std::thread::current().name().unwrap_or("unnamed"));
+    }
+
+    snapshot
+}
+
+/// Fallback git status collection using the git2 library, used when the `git` CLI is not found.
+fn collect_git_status_git2(mut snapshot: GitStatusSnapshot, repo_path: &std::path::Path) -> GitStatusSnapshot {
+    use crate::status_char;
+    let Ok(repo) = Repository::open(repo_path).or_else(|_| Repository::discover(repo_path)) else {
+        return snapshot;
+    };
+
+    snapshot.is_git_repo = true;
+
+    if let Ok(head) = repo.head() {
+        if let Some(name) = head.shorthand() {
+            snapshot.branch_name = name.to_string();
+        }
+    }
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .exclude_submodules(true)
+        .include_unmodified(false)
+        .renames_head_to_index(false)
+        .renames_index_to_workdir(false);
+
+    if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
+        for entry in statuses.iter() {
+            let path = entry.path().unwrap_or("").to_string();
+            let status = entry.status();
+
+            if status.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED | Status::INDEX_RENAMED) {
+                snapshot.staged.push(FileEntry {
+                    path: path.clone(),
+                    status: status_char(status, true),
+                    is_staged: true,
+                });
+            }
+            if status.intersects(Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED) {
+                snapshot.unstaged.push(FileEntry {
+                    path: path.clone(),
+                    status: status_char(status, false),
+                    is_staged: false,
+                });
+            }
+            if status.contains(Status::WT_NEW) {
+                snapshot.untracked.push(FileEntry {
+                    path,
+                    status: "?".to_string(),
+                    is_staged: false,
+                });
+            }
+        }
+    }
 
     snapshot
 }
@@ -122,9 +263,6 @@ pub(crate) fn collect_file_tree(
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
 
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
             if name == "node_modules" || name == "target" {
                 continue;
             }
