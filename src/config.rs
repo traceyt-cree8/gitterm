@@ -1,5 +1,6 @@
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -318,6 +319,11 @@ pub struct WorkspaceConfig {
     pub run_command: Option<String>,
     #[serde(default)]
     pub bottom_terminals: Vec<BottomTerminalConfig>,
+    /// Environment variables to inject into all terminal sessions in this workspace.
+    /// Edit workspaces.json to add any vars without recompiling, e.g.:
+    /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

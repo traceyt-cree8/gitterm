@@ -1940,7 +1940,7 @@ impl TabState {
     }
 
     #[allow(dead_code)]
-    fn fetch_file_tree(&mut self, show_hidden: bool) {
+    fn fetch_file_tree(&mut self, _show_hidden: bool) {
         self.file_tree.clear();
 
         if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
@@ -2588,6 +2588,7 @@ struct Workspace {
     console: ConsoleState,
     bottom_terminals: Vec<BottomTerminal>,
     active_bottom_tab: BottomPanelTab,
+    env: std::collections::HashMap<String, String>,
 }
 
 impl Workspace {
@@ -2605,6 +2606,7 @@ impl Workspace {
             console,
             bottom_terminals: Vec::new(),
             active_bottom_tab: BottomPanelTab::Console,
+            env: std::collections::HashMap::new(),
         }
     }
 
@@ -3361,6 +3363,7 @@ impl App {
                             dir: bt.cwd.to_string_lossy().to_string(),
                         })
                         .collect(),
+                    env: ws.env.clone(),
                 })
                 .collect(),
             active_workspace: self.active_workspace_idx,
@@ -3813,6 +3816,7 @@ impl App {
                 };
                 let mut workspace = Workspace::new(name, dir.clone(), ws_config.color);
                 workspace.abbrev = ws_config.abbrev.clone();
+                workspace.env = ws_config.env.clone();
                 // Restore saved run command if present
                 if let Some(cmd) = &ws_config.run_command {
                     workspace.console.run_command = Some(cmd.clone());
@@ -3948,6 +3952,7 @@ impl App {
         scrollback_lines: usize,
         theme: &AppTheme,
         terminal_font_size: f32,
+        extra_env: &[(&str, &str)],
     ) -> iced_term::settings::Settings {
         #[cfg(target_os = "windows")]
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
@@ -4000,6 +4005,10 @@ impl App {
 
         if let Some(cmd) = startup_command {
             env.insert("GITTERM_STARTUP_CMD".to_string(), cmd.to_string());
+        }
+
+        for (key, value) in extra_env {
+            env.insert(key.to_string(), value.to_string());
         }
 
         env.insert("CLAUDECODE".to_string(), String::new());
@@ -4093,6 +4102,12 @@ fi
     }
 
     fn create_tab(&mut self, repo_path: PathBuf, startup_command: Option<String>) -> TabState {
+        // Collect workspace env vars to inject into the terminal session
+        let extra_env: Vec<(String, String)> = self.active_workspace()
+            .map(|ws| ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let extra_env_refs: Vec<(&str, &str)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
@@ -4105,6 +4120,7 @@ fi
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
+            &extra_env_refs,
         );
 
         if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, settings) {
@@ -4126,6 +4142,7 @@ fi
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
+            &[],
         );
         let terminal = iced_term::Terminal::new(id as u64, settings)
             .ok()
@@ -4392,7 +4409,7 @@ fi
             }
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
-                let mut workspace_dirty = false;
+                let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
                 if let Some(tab) = self.active_tab_mut() {
@@ -5803,7 +5820,7 @@ fi
             Event::OpenMarkdownInBrowser => {
                 // Write HTML to temp file and open in browser
                 if let Some(tab) = self.active_tab() {
-                    let mut html_to_open = tab.webview_content.clone();
+                    let html_to_open = tab.webview_content.clone();
 
                     if html_to_open.is_none() {
                         // TODO: This should be async! Reading files synchronously on main thread
@@ -6789,7 +6806,7 @@ fi
 
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
             let settings =
-                Self::build_terminal_settings(&tab.repo_path, None, scrollback, &theme, font_size);
+                Self::build_terminal_settings(&tab.repo_path, None, scrollback, &theme, font_size, &[]);
             if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
                 terminal.handle(iced_term::Command::AddBindings(
                     Self::standard_noop_bindings(),
@@ -6803,7 +6820,7 @@ fi
         for ws in self.workspaces.iter_mut() {
             for bt in ws.bottom_terminals.iter_mut() {
                 let settings =
-                    Self::build_terminal_settings(&bt.cwd, None, scrollback, &theme, font_size);
+                    Self::build_terminal_settings(&bt.cwd, None, scrollback, &theme, font_size, &[]);
                 bt.terminal = iced_term::Terminal::new(bt.id as u64, settings)
                     .ok()
                     .map(|mut t| {

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use iced::{color, Color, Theme};
 use iced_term;
 

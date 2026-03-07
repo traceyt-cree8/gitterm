@@ -18,8 +18,22 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
-# Copy binary
-cp "$BUILD_DIR/gitterm" "$APP_DIR/Contents/MacOS/$APP_NAME"
+# Copy binary with a different name so the launcher script can call it directly
+cp "$BUILD_DIR/gitterm" "$APP_DIR/Contents/MacOS/gitterm-bin"
+
+# Create launcher script as the app executable — bypasses Launch Services
+# deduplication so each double-click spawns a fresh process
+cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << 'LAUNCHER'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+# Spawn binary detached so launcher exits immediately.
+# macOS then sees no running process for this bundle, allowing
+# subsequent double-clicks to spawn additional instances.
+nohup "$DIR/gitterm-bin" "$@" >/dev/null 2>&1 &
+disown
+exit 0
+LAUNCHER
+chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
 
 # Copy icon
 cp "$PROJECT_DIR/assets/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
@@ -52,6 +66,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>LSMultipleInstancesProhibited</key>
+    <false/>
 </dict>
 </plist>
 EOF
